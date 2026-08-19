@@ -1,0 +1,64 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Switcher",
+  "version": "0.2.0",
+  "description": "Alt+Tab for browser tabs. Hold Ctrl+Q, tap to cycle through recent tabs, release to jump.",
+
+  "permissions": [
+    "tabs",
+    "storage",
+    "scripting",
+    "webNavigation"
+  ],
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js"],
+      "run_at": "document_start"
+    }
+  ],
+
+  "action": {
+    "default_title": "Tab Switcher",
+    "default_icon": { "128": "images/logo128.png" },
+    "default_popup": "popup/popup.html"
+  },
+
+  "icons": {
+    "128": "images/logo128.png",
+    "512": "images/logo512.png"
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "images/favicon.png",
+        "images/unknown.svg",
+        "images/chrome.newtab.svg",
+        "images/chrome.extensions.svg",
+        "images/chrome.history.svg",
+        "images/chrome.settings.svg",
+        "images/chrome.downloads.svg",
+        "images/chrome.bookmarks.svg"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  "commands": {
+    "next-tab": {
+      "suggested_key": { "default": "Ctrl+Q", "mac": "MacCtrl+Q" },
+      "description": "Show switcher / move to next tab"
+    },
+    "prev-tab": {
+      "suggested_key": { "default": "Ctrl+Shift+Q", "mac": "MacCtrl+Shift+Q" },
+      "description": "Move to previous tab"
+    }
+  }
+}

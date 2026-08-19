@@ -1,0 +1,179 @@
+:root {
+  --primary-color: #7aa2ff;
+  --text-color: #121526e0;
+  --header-color: #12152694;
+  --border-color: #00000024;
+}
+
+body {
+  width: 360px;
+  margin: 0;
+  padding: 16px;
+  color: var(--text-color);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+h2 {
+  margin: 0;
+  color: var(--text-color);
+}
+
+h4 {
+  margin: 0 0 4px;
+  color: var(--text-color);
+  font-size: 16px;
+}
+
+a {
+  color: var(--text-color);
+  text-decoration: none;
+}
+
+button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  background-color: var(--primary-color);
+  box-shadow: 0 2px 4px #0003;
+  color: #fff;
+  cursor: pointer;
+  transition: background-color 0.2s;
+
+  &:hover {
+    background: color-mix(in srgb, var(--primary-color) 100%, #fff 20%);
+  }
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 26px;
+}
+
+.flex {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+
+  &.column {
+    flex-direction: column;
+  }
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.row + .row {
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 70%, #fff 30%);
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 70%, var(--primary-color) 6%);
+  border-radius: 4px;
+  box-shadow: 0 10px 25px #0f13240f, inset 0 1px #ffffffd0;
+}
+
+.form-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.shortcut {
+  padding: 2px 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-color);
+}
+
+/* Thumbnail count slider */
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 138px;
+  height: 6px;
+  margin: 0;
+  border-radius: 4px;
+  outline: none;
+  background: var(--border-color);
+  cursor: pointer;
+  transition: background 0.2s;
+
+  &::-webkit-slider-thumb {
+    --size: 18px;
+    appearance: none;
+    width: var(--size);
+    height: var(--size);
+    border-radius: 50%;
+    background: #7aa2ff;
+    transition: transform 0.15s;
+  }
+
+  &::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+  }
+}
+
+/* Accent colour swatches — the radio input itself is hidden and the
+   .radio-mark circle stands in for it. */
+.theme-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.theme-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #ddd;
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.theme-option input[type="radio"] {
+  display: none;
+}
+
+.radio-mark {
+  --size: 18px;
+  position: relative;
+  width: var(--size);
+  height: var(--size);
+  border-radius: 50%;
+  background-color: var(--color);
+  transition: all 0.2s;
+
+  &:hover {
+    transform: scale(1.15);
+  }
+}
+
+.theme-option input[type="radio"]:checked + .radio-mark:after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: calc(var(--size) + 2px);
+  height: calc(var(--size) + 2px);
+  border: 2px solid var(--color);
+  border-radius: 50%;
+}

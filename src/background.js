@@ -1,0 +1,438 @@
+/**
+ * Service worker: owns tab state, the keyboard commands, and thumbnail capture.
+ *
+ * The switcher is driven from here. The worker keeps tabs ordered most-recently-used,
+ * and on Ctrl+Q it messages the *current tab's* content script to draw the overlay.
+ * The overlay lives in the page rather than in an extension window because Chrome
+ * gives extensions no way to draw a floating window over the viewport.
+ *
+ * That indirection is the source of most of the complexity below: the current tab may
+ * be a page where content scripts cannot run (chrome://, the Web Store, an error page),
+ * in which case we have to switch to a tab that can host the overlay first.
+ */
+
+/** Chrome reports shortcuts as display strings; map the first chunk to a KeyboardEvent.key. */
+const MODIFIER_KEYS = {
+  Ctrl: "Control",
+  Control: "Control",
+  Alt: "Alt",
+  Option: "Alt",
+  Shift: "Shift",
+  Command: "Meta",
+  Meta: "Meta",
+  Win: "Meta",
+  "⊞": "Meta",
+  "⌃": "Control",
+  "⌥": "Alt",
+  "⇧": "Shift",
+  "⌘": "Meta",
+};
+
+/** Internal pages we ship a recognisable icon for; anything else falls back to "unknown". */
+const KNOWN_INTERNAL_PAGES = new Set([
+  "newtab",
+  "extensions",
+  "history",
+  "settings",
+  "downloads",
+  "bookmarks",
+]);
+
+/** chrome://, edge://, brave://… — capture group 2 is the host, e.g. "settings". */
+const INTERNAL_URL = /^(chrome|edge|brave|opera|vivaldi):\/\/([^/]+)/i;
+
+const DEFAULT_PREFS = {
+  shortcut: "Ctrl+Q",
+  color: "blue",
+  layout: "overlays",
+  tabCount: 6,
+};
+
+/**
+ * We keep more thumbnails than the overlay shows, so cycling past the visible
+ * window still has images ready.
+ */
+const THUMBNAIL_OVERSCAN = 1.5;
+
+/** Tab the user is actually looking at. Tracked so we never screenshot a background tab. */
+let activeTabId = 0;
+
+// ---------------------------------------------------------------------------
+// Tab classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide how a tab should be represented, and — more importantly — whether it can
+ * host the overlay at all. Only "normal" tabs can: Chrome forbids content scripts
+ * on its internal pages and on the Web Store.
+ *
+ * @returns {"normal"|"unknown"|`chrome.${string}`}
+ */
+function classifyTab(tab) {
+  const url = tab.url ?? tab.pendingUrl ?? "";
+
+  // Explicitly excluded by Chrome, and not matched by the INTERNAL_URL pattern below
+  // because they are ordinary https:// URLs.
+  if (
+    url.startsWith("https://chromewebstore.google.com/") ||
+    url.startsWith("https://chrome.google.com/webstore")
+  ) {
+    return "unknown";
+  }
+
+  const internal = url.match(INTERNAL_URL);
+  if (internal) {
+    const page = internal[2].toLowerCase();
+    return KNOWN_INTERNAL_PAGES.has(page) ? `chrome.${page}` : "unknown";
+  }
+
+  return /^(https?|file|ftp):/.test(url) ? "normal" : "unknown";
+}
+
+/**
+ * True when the tab's main frame failed to load. Content scripts do not run on
+ * Chrome's error pages, so the overlay has to go somewhere else.
+ *
+ * This is the only use of the webNavigation permission.
+ */
+async function isErrorPage(tabId) {
+  const frames = await chrome.webNavigation.getAllFrames({ tabId });
+  return (
+    !frames?.[0] ||
+    (frames[0].frameType === "outermost_frame" && frames[0].errorOccurred)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Preferences and shortcuts
+// ---------------------------------------------------------------------------
+
+/** The shortcut the user has actually bound, which may differ from our suggestion. */
+async function getShortcut() {
+  const commands = await chrome.commands.getAll();
+  return commands.find((command) => command.name === "next-tab")?.shortcut;
+}
+
+/**
+ * The modifier the user must keep held for the switcher to stay open. Derived from
+ * the bound shortcut, so rebinding to e.g. Alt+E keeps the hold-to-cycle behaviour.
+ */
+async function getModifierKey() {
+  const shortcut = await getShortcut();
+  if (!shortcut) return null;
+
+  // "Ctrl+Q" -> ["Ctrl","Q"], but macOS reports glyph runs like "⌃Q" with no separator.
+  const parts = shortcut.includes("+")
+    ? shortcut.split("+").map((part) => part.trim())
+    : shortcut.split("");
+
+  return MODIFIER_KEYS[parts[0]] ?? null;
+}
+
+async function getPrefs() {
+  const stored = await chrome.storage.sync.get(["color", "layout", "tabCount"]);
+  const shortcut = await getShortcut();
+
+  return {
+    shortcut: shortcut ?? DEFAULT_PREFS.shortcut,
+    color: stored.color ?? DEFAULT_PREFS.color,
+    layout: stored.layout ?? DEFAULT_PREFS.layout,
+    tabCount: stored.tabCount ?? DEFAULT_PREFS.tabCount,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tab list
+// ---------------------------------------------------------------------------
+
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function activateTab(tabId) {
+  return chrome.tabs.update(tabId, { active: true });
+}
+
+/**
+ * Tabs of the current window in most-recently-used order, trimmed and reduced to
+ * just what the overlay needs to draw.
+ */
+async function buildTabList() {
+  const tabs = await chrome.tabs.query({ currentWindow: true });
+  const { tabCount } = await getPrefs();
+
+  tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0));
+
+  // Several identical "New Tab" entries are noise in a switcher — keep the most
+  // recent one only. Everything else stays, duplicates included.
+  let seenNewTab = false;
+  const deduped = tabs.filter((tab) => {
+    if (classifyTab(tab) !== "chrome.newtab") return true;
+    if (seenNewTab) return false;
+    seenNewTab = true;
+    return true;
+  });
+
+  deduped.length = Math.min(deduped.length, Math.round(tabCount * THUMBNAIL_OVERSCAN));
+
+  return deduped.map((tab) => ({
+    id: tab.id,
+    title: tab.title ?? tab.url ?? tab.pendingUrl,
+    favIconUrl: tab.favIconUrl,
+    url: tab.url,
+    type: classifyTab(tab),
+    isPinned: tab.pinned,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnails
+//
+// PRIVACY: captureScreenshot() photographs whatever is on screen — including pages
+// you are logged into. Images stay in chrome.storage.session, which is in-memory,
+// dropped when the browser closes, and never synced. Nothing here touches the network.
+// This is the single capture path; gate or delete it and the feature is gone.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the session-storage bucket for a window. Keyed by window id so two windows
+ * do not show each other's thumbnails.
+ *
+ * @returns {[string, {thumbnails: Array<{tabId: number, thumbnail: string}>}|undefined]}
+ */
+async function getWindowBucket(windowId) {
+  if (!windowId) {
+    const current = await chrome.windows.getCurrent();
+    windowId = current.id.toString();
+  }
+  const stored = await chrome.storage.session.get(windowId);
+  return [windowId, stored[windowId]];
+}
+
+/** Quality 10 JPEG: these are 140px-wide previews, so the loss is invisible and the bytes matter. */
+async function captureScreenshot() {
+  try {
+    const window = await chrome.windows.getCurrent();
+    return await chrome.tabs.captureVisibleTab(window.id, {
+      format: "jpeg",
+      quality: 10,
+    });
+  } catch (error) {
+    // Expected on chrome:// pages and whenever the tab is not renderable yet.
+    console.warn("Failed to capture screenshot", error);
+    return undefined;
+  }
+}
+
+/** Store a thumbnail, most-recent-first, evicting the oldest past the overscan limit. */
+async function setThumbnail(tabId, dataUrl) {
+  const [key, bucket] = await getWindowBucket();
+  const { tabCount } = await getPrefs();
+
+  const thumbnails = bucket?.thumbnails ?? [];
+  const existing = thumbnails.findIndex((entry) => entry.tabId === tabId);
+  if (existing !== -1) thumbnails.splice(existing, 1);
+  thumbnails.unshift({ tabId, thumbnail: dataUrl });
+
+  thumbnails.length = Math.min(
+    thumbnails.length,
+    Math.round(tabCount * THUMBNAIL_OVERSCAN),
+  );
+
+  return chrome.storage.session.set({ [key]: { thumbnails } });
+}
+
+async function isOverlayOpen() {
+  const stored = await chrome.storage.session.get("isOverlayOpen");
+  return stored.isOverlayOpen ?? false;
+}
+
+/**
+ * Capture the given tab, but only if it is genuinely what the user is looking at and
+ * the overlay is not up — otherwise we would photograph the switcher itself.
+ */
+async function captureThumbnailFor(tabId) {
+  if (activeTabId !== tabId || (await isOverlayOpen())) return;
+
+  const screenshot = await captureScreenshot();
+  if (screenshot) await setThumbnail(tabId, screenshot);
+}
+
+// ---------------------------------------------------------------------------
+// Overlay
+// ---------------------------------------------------------------------------
+
+/** First item matching an async predicate, evaluated in order. */
+async function findAsync(items, predicate) {
+  for (const item of items) {
+    if (await predicate(item)) return item;
+  }
+  return undefined;
+}
+
+async function sendOpenOverlay(tabId, tabs, command, fromCurrentTab) {
+  const [modifierKey, window, prefs] = await Promise.all([
+    getModifierKey(),
+    chrome.windows.getCurrent(),
+    getPrefs(),
+  ]);
+
+  return chrome.tabs.sendMessage(tabId, {
+    type: "OPEN_OVERLAY",
+    tabs,
+    modifierKey,
+    direction: command === "next-tab" ? 1 : -1,
+    windowId: window.id.toString(),
+    tabId,
+    fromCurrentTab,
+    prefs,
+  });
+}
+
+/**
+ * Last resort: the current tab cannot host the overlay, so switch to one that can
+ * and draw it there. The user sees a tab change before the switcher appears, which
+ * is the price of Chrome not allowing overlays on its own pages.
+ */
+async function openOverlayElsewhere(currentTabId, tabs, command) {
+  const host = await findAsync(
+    tabs,
+    async (tab) =>
+      tab.id !== currentTabId &&
+      tab.type === "normal" &&
+      !(await isErrorPage(tab.id)),
+  );
+  if (!host) return false;
+
+  await activateTab(host.id);
+
+  // Activating changed the MRU order, so rebuild rather than reusing the stale list.
+  const refreshed = await buildTabList();
+  try {
+    await sendOpenOverlay(host.id, refreshed, command, false);
+  } catch (error) {
+    console.warn("OPEN_OVERLAY fallback failed", error);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Preferred path: draw on the tab the user is already on. Falls back if the content
+ * script is missing — it may not have been injected yet, or the page may block it.
+ */
+async function openOverlayHere(tabId, tabs, command) {
+  try {
+    await sendOpenOverlay(tabId, tabs, command, true);
+  } catch (error) {
+    console.warn("OPEN_OVERLAY failed", error);
+    return openOverlayElsewhere(tabId, tabs, command);
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+/**
+ * Declared content scripts only auto-inject on navigation, so tabs already open when
+ * the extension installs or the browser starts have no overlay code in them. Inject
+ * once to cover them. This is the only use of the scripting permission.
+ */
+async function injectIntoOpenTabs() {
+  const tabs = await chrome.tabs.query({});
+
+  const injectable = tabs.filter(
+    (tab) =>
+      tab.id &&
+      classifyTab(tab) === "normal" &&
+      !tab.frozen &&
+      !tab.discarded &&
+      tab.status !== "unloaded",
+  );
+
+  // allSettled: a tab that refuses injection must not stop the rest.
+  await Promise.allSettled(
+    injectable.map((tab) =>
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["content/content.js"],
+      }),
+    ),
+  );
+}
+
+async function initialize() {
+  // Content scripts count as an untrusted context; without this they cannot read the
+  // thumbnails they need to render. Still unreachable from page JavaScript, which has
+  // no access to chrome.storage at all.
+  await chrome.storage.session.setAccessLevel({
+    accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS",
+  });
+  await injectIntoOpenTabs();
+}
+
+// ---------------------------------------------------------------------------
+// Event wiring
+// ---------------------------------------------------------------------------
+
+chrome.runtime.onInstalled.addListener(async ({ reason }) => {
+  if (reason !== "install" && reason !== "update") return;
+
+  // Fire before any await: openPopup() is only honoured close to the install event.
+  if (reason === "install") chrome.action.openPopup();
+
+  await initialize();
+
+  const tab = await getActiveTab();
+  activeTabId = tab?.id ?? 0;
+  await captureThumbnailFor(activeTabId);
+});
+
+chrome.runtime.onStartup.addListener(initialize);
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.id) return;
+
+  activeTabId = tab.id;
+  await captureThumbnailFor(tabId);
+});
+
+// Re-capture once a page finishes loading, so the thumbnail is not of a blank page.
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (tabId === activeTabId && changeInfo.status === "complete") {
+    await captureThumbnailFor(tabId);
+  }
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "ACTIVATE_TAB") return activateTab(message.id);
+  if (message.type === "TRY_CLOSE_TAB") return chrome.tabs.remove(message.id);
+});
+
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== "next-tab" && command !== "prev-tab") return;
+
+  const currentTab = await getActiveTab();
+  if (!currentTab) return;
+
+  const tabs = await buildTabList();
+  if (tabs.length < 2) return;
+
+  const canHostOverlay =
+    classifyTab(currentTab) === "normal" && !(await isErrorPage(currentTab.id));
+
+  const opened = canHostOverlay
+    ? await openOverlayHere(currentTab.id, tabs, command)
+    : await openOverlayElsewhere(currentTab.id, tabs, command);
+
+  // No tab could host the overlay — at least honour the keypress by switching.
+  if (!opened) {
+    console.warn("No suitable tab found to show overlay");
+    const target = tabs.find((tab) => tab.id !== currentTab.id);
+    if (target) await activateTab(target.id);
+  }
+});

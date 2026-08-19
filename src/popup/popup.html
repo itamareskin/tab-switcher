@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Tab Switcher</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="column flex">
+      <h2 class="header">
+        <img style="width: 32px; height: 32px" src="../images/logo128.png" alt="" />
+        <span>Tab Switcher</span>
+      </h2>
+
+      <div class="text">
+        Press <b>Ctrl+Q</b> to open the switcher, keep pressing <b>Q</b> to cycle through
+        recent tabs, release <b>Ctrl</b> or click a thumbnail to jump to the highlighted
+        tab.
+        <br />Press <b>Esc</b> to cancel.
+      </div>
+
+      <div style="width: 100%">
+        <h4>Settings</h4>
+
+        <div class="settings-form" id="themeOptions">
+          <div class="row">
+            <label>Show switcher on</label>
+            <div>
+              <a id="shortcutsLink" href="chrome://extensions/shortcuts" target="_blank">
+                <span class="shortcut" id="shortcutValue">Ctrl+Q</span>
+              </a>
+            </div>
+          </div>
+
+          <div class="row">
+            <label>Accent Color</label>
+            <div class="theme-options">
+              <label class="theme-option">
+                <input type="radio" name="theme" value="blue" checked />
+                <span class="radio-mark" style="--color: #7aa2ff"></span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="theme" value="pink" />
+                <span class="radio-mark" style="--color: #ff8ad4"></span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="theme" value="yellow" />
+                <span class="radio-mark" style="--color: #ffd43b"></span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="theme" value="green" />
+                <span class="radio-mark" style="--color: #5ee17c"></span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="theme" value="red" />
+                <span class="radio-mark" style="--color: #ff6b6b"></span>
+              </label>
+              <label class="theme-option">
+                <input type="radio" name="theme" value="white" />
+                <span class="radio-mark" style="--color: #d9d9d9"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="row">
+            <label for="thumbCount">Thumbnails</label>
+            <div id="thumbCountWrapper" class="form-field">
+              <span id="thumbCountValue">6</span>
+              <input type="range" id="thumbCount" name="thumbCount" min="3" max="16" step="1" value="6" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: end; width: 100%">
+        <button id="ok"><span>OK</span></button>
+      </div>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

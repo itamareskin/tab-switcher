@@ -1,0 +1,604 @@
+/**
+ * Content script: draws the switcher overlay inside the page.
+ *
+ * Chrome gives extensions no way to float a window over the viewport, so the overlay
+ * is injected into whatever page you are on. It lives in a *closed* shadow root to keep
+ * it out of reach of the page's own scripts and styles.
+ *
+ * Runs at document_start on every page, and is also injected once into already-open
+ * tabs at install/startup — hence the re-entry guard below.
+ */
+
+(() => {
+  // Injected tabs can also receive the declared content script, which would double
+  // every listener. Cheap guard; the property lives in the isolated world, not the page.
+  if (window.__tabSwitcherLoaded) return;
+  window.__tabSwitcherLoaded = true;
+
+  // ---------------------------------------------------------------------------
+  // Constants
+  // ---------------------------------------------------------------------------
+
+  /** Unlikely-to-collide prefix for our class names, since they share the page's DOM. */
+  const PREFIX = "g7Kf9x";
+
+  const CLASS = {
+    container: `${PREFIX}_container`,
+    overlay: `${PREFIX}_overlay`,
+    item: `${PREFIX}_item`,
+    preview: `${PREFIX}_preview`,
+    text: `${PREFIX}_text`,
+    thumbnail: `${PREFIX}_thumbnail`,
+    icon_thumbnail: `${PREFIX}_icon_thumbnail`,
+    active: `${PREFIX}_active`,
+    icon: `${PREFIX}_icon`,
+    close_button: `${PREFIX}_close_button`,
+    close_button_wrapper: `${PREFIX}_close_button_wrapper`,
+  };
+
+  /** Used only when the host document is itself an SVG — see mountOverlay(). */
+  const SVG_FOREIGN_OBJECT_ID = `${PREFIX}-fo`;
+  const SVG_STYLE_ID = `${PREFIX}-style`;
+
+  const FALLBACK_FAVICON = chrome.runtime.getURL("images/favicon.png");
+
+  const THEMES = {
+    pink: { main: "#ff8ad4", thumbBg: "rgba(255, 138, 212, 0.3)", overlayBg: "#3d2236a1" },
+    blue: { main: "#7aa2ff", thumbBg: "rgba(122, 162, 255, 0.3)", overlayBg: "#25314da1" },
+    yellow: { main: "#ffd43b", thumbBg: "rgba(255, 212, 59, 0.3)", overlayBg: "#3a300da8" },
+    green: { main: "#5ee17c", thumbBg: "rgba(94, 225, 124, 0.25)", overlayBg: "#1f3225a1" },
+    red: { main: "#ff6b6b", thumbBg: "rgba(255, 107, 107, 0.3)", overlayBg: "#3a1b1ba8" },
+    white: { main: "#d9d9d9", thumbBg: "rgba(217, 217, 217, 0.25)", overlayBg: "#222222a6" },
+  };
+
+  const DEFAULT_PREFS = { shortcut: "Ctrl+Q", color: "blue", layout: "overlays", tabCount: 6 };
+
+  const HTML_ESCAPES = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+
+  let tabs = [];
+  let selectedIndex = 0;
+  let isOpen = false;
+  let modifierKey = "Control";
+  let prefs = DEFAULT_PREFS;
+
+  /**
+   * The shadow root is closed, so `host.shadowRoot` is null even to us. These
+   * references are the only handles that exist — which is exactly the point.
+   */
+  let host = null;
+  let shadow = null;
+  let overlay = null;
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Escape a value for interpolation into the markup below.
+   *
+   * Applied to *every* interpolated value, not just the obviously risky ones. Tab
+   * titles and favicon URLs are chosen by the pages they come from, so both are
+   * attacker-influenced; treating them uniformly is what keeps that from mattering.
+   */
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]);
+  }
+
+  /**
+   * Parse a markup string into a detached element.
+   *
+   * DOMParser rather than innerHTML: scripts created this way carry the
+   * "already started" flag and never execute, even if one were somehow injected.
+   */
+  function parseElement(markup, mimeType = "text/html") {
+    const parsed = new DOMParser().parseFromString(markup, mimeType);
+    const rootTag = markup.match(/<\s*([a-zA-Z0-9-]+)/)[1];
+    return document.adoptNode(parsed.querySelector(rootTag));
+  }
+
+  function sendToWorker(message) {
+    return chrome.runtime.sendMessage(message);
+  }
+
+  /**
+   * windowId always arrives in the OPEN_OVERLAY message. Upstream had a fallback that
+   * called chrome.windows.getCurrent() — an API content scripts cannot reach, so it
+   * could only ever have thrown. Dropped rather than carried forward.
+   */
+  async function getThumbnails(windowId) {
+    const stored = await chrome.storage.session.get(windowId);
+    return stored[windowId]?.thumbnails ?? [];
+  }
+
+  /** Lets the worker skip screenshotting while the switcher itself is on screen. */
+  function setOverlayOpenFlag(value) {
+    return chrome.storage.session.set({ isOverlayOpen: value });
+  }
+
+  async function withThumbnails(tabList, windowId) {
+    const thumbnails = await getThumbnails(windowId);
+    return tabList.map((tab) => ({
+      ...tab,
+      thumbnail: thumbnails.find((entry) => entry.tabId === tab.id)?.thumbnail,
+    }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Markup
+  // ---------------------------------------------------------------------------
+
+  const OVERLAY_STYLES = `
+    <style>
+      .${CLASS.overlay} {
+        --gap: 20px;
+        --color-main: currentColor;
+        --color-thumbnail: currentColor;
+        --color-overlay: currentColor;
+        border: 1px solid #55555557;
+        user-select: none;
+        display: flex;
+        background: var(--color-overlay);
+        box-shadow: 3px 4px 16px 3px #0b0c1285;
+        backdrop-filter: blur(10px);
+        border-radius: 20px;
+        padding: var(--gap) var(--gap) 8px var(--gap);
+        gap: var(--gap);
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font: 12px sans-serif;
+        color: white;
+        flex-wrap: wrap;
+        width: max-content;
+        max-width: calc(100dvw - 2*var(--gap) - 2px);
+        box-sizing: border-box;
+        align-content: flex-start;
+        justify-content: center;
+        transition: opacity 150ms ease-out;
+        outline: 0 solid transparent;
+        opacity: 0;
+        &.show {
+          opacity: 1;
+        }
+        &.exportable {
+          position: static;
+          transform: none;
+        }
+      }
+
+      .${CLASS.item} {
+        padding-bottom: 6px;
+        border-radius: 6px;
+        display: flex;
+        flex-direction: column;
+        flex: 0 0 140px;
+        max-width: 140px;
+        box-sizing: border-box;
+        position: relative;
+        transition: transform 200ms ease-out;
+
+        &:hover {
+          cursor: pointer;
+          transform: scale(1.05);
+          .${CLASS.preview} {
+            outline: 2px solid var(--color-main);
+          }
+          .${CLASS.close_button_wrapper} {
+            display: flex;
+          }
+        }
+        &.${CLASS.active}, &:hover.${CLASS.active} {
+          transform: scale(1.1);
+          .${CLASS.preview} {
+            background: var(--color-thumbnail);
+            outline: 2px solid var(--color-main);
+            box-shadow: 2px 4px 10px #1f223570;
+          }
+        }
+      }
+      .${CLASS.preview} {
+        background: rgba(255, 255, 255, 0.08);
+        height: 90px;
+        margin-bottom: 6px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 2px solid transparent;
+        transition: outline-color 200ms ease-out;
+        outline: 0 solid transparent;
+      }
+      .${CLASS.text} {
+        font-size: 14px;
+        font-family: system-ui;
+        display: flex;
+        gap: 4px;
+        align-items: center;
+        min-width: 0;
+        filter: drop-shadow(1px 1px 4px rgba(34,34,34,0.52));
+        span {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          min-width: 0;
+          flex: 1;
+        }
+      }
+      .${CLASS.thumbnail} {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+        display: block;
+        overflow: visible;
+      }
+      .${CLASS.icon_thumbnail} {
+        width: 48px;
+        position: relative;
+        top: calc(50% - 24px);
+        left: calc(50% - 24px);
+        opacity: 0.3;
+      }
+      .${CLASS.icon} {
+        height: 14px;
+        width: 14px;
+        vertical-align: bottom;
+      }
+      .${CLASS.close_button_wrapper} {
+        display: none;
+        align-items: center;
+        justify-content: center;
+        position: absolute;
+        height: 24px;
+        width: 24px;
+        top: -10px;
+        right: -10px;
+      }
+      .${CLASS.close_button} {
+        height: 20px;
+        width: 20px;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border-radius: 50%;
+        border: 0;
+        background: #ff6b6b;
+        display: flex;
+        cursor: pointer;
+        &:hover {
+          background: #ff8282;
+        }
+      }
+
+      @media (max-width: 600px) {
+        .${CLASS.overlay} {
+          --gap: 0;
+          padding: 8px;
+          flex-direction: column;
+
+          .${CLASS.item} {
+            flex: 1;
+            max-width: 180px;
+
+            .${CLASS.text} {
+              padding: 8px;
+              border-radius: 8px;
+            }
+
+            &:hover, &.${CLASS.active}, &:hover.${CLASS.active} {
+              transform: scale(1);
+              .${CLASS.text} {
+                color: white;
+                outline: 2px solid var(--color-main);
+              }
+            }
+          }
+
+          .${CLASS.preview} {
+            display: none;
+          }
+        }
+      }
+    </style>
+  `;
+
+  const CLOSE_ICON = `<svg height="18px" width="18px" viewBox="0 -960 960 960" fill="white"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>`;
+
+  /** Thumbnail if we have one, a stock glyph for internal pages, otherwise empty. */
+  function previewMarkup(tab) {
+    if (tab.thumbnail) {
+      return `<img class="${CLASS.thumbnail}" src="${escapeHtml(tab.thumbnail)}" alt="thumb">`;
+    }
+    if (tab.type !== "normal") {
+      const icon = chrome.runtime.getURL(`images/${tab.type}.svg`);
+      return `<img class="${CLASS.icon_thumbnail}" src="${escapeHtml(icon)}" alt="thumb">`;
+    }
+    return "";
+  }
+
+  function itemMarkup(tab, index, activeIndex) {
+    const closeButton = tab.isPinned
+      ? ""
+      : `<div class="${CLASS.close_button_wrapper}">
+           <button data-tabid="${escapeHtml(tab.id)}" class="${CLASS.close_button}">${CLOSE_ICON}</button>
+         </div>`;
+
+    return `
+      <div data-index="${escapeHtml(index)}" class="${CLASS.item} ${index === activeIndex ? CLASS.active : ""}">
+        <div class="${CLASS.preview}">${previewMarkup(tab)}</div>
+        <span class="${CLASS.text}">
+          <img class="${CLASS.icon}" src="${escapeHtml(tab.favIconUrl || FALLBACK_FAVICON)}" alt="favicon">
+          <span>${tab.title ? escapeHtml(tab.title) : "(untitled)"}</span>
+        </span>
+        ${closeButton}
+      </div>
+    `;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build the host element and its shadow root, once per page.
+   *
+   * `mode: "closed"` is a deliberate change from upstream, which used "open". An open
+   * root is readable via `host.shadowRoot` by any script on the page, which exposed the
+   * titles, URLs, and screenshots of every other tab while the switcher was up.
+   */
+  function createHost() {
+    const container = parseElement(`
+      <div class="${CLASS.container}" style="position: fixed; top: 0; left: 0; z-index: 2147483647"/>
+    `);
+
+    shadow = container.attachShadow({ mode: "closed" });
+
+    const wrapper = parseElement(`<div tabindex="-1"></div>`);
+    overlay = parseElement(`<div class="${CLASS.overlay}" tabindex="-1"></div>`);
+
+    overlay.addEventListener("pointerdown", onPointerDown);
+
+    // Attached once here rather than per render, or the handlers accumulate.
+    overlay.addEventListener(
+      "error",
+      (event) => {
+        if (event.target instanceof HTMLImageElement) event.target.src = FALLBACK_FAVICON;
+      },
+      true,
+    );
+
+    wrapper.appendChild(overlay);
+    shadow.appendChild(parseElement(OVERLAY_STYLES));
+    shadow.appendChild(wrapper);
+
+    return container;
+  }
+
+  /**
+   * Put the host into the document.
+   *
+   * An SVG document has no <body> and will not lay out HTML children, so we hide the
+   * page's own content and wrap the overlay in a <foreignObject>. Rare, but a plain
+   * appendChild renders nothing at all there.
+   */
+  function mountOverlay(element) {
+    if (!(document.documentElement instanceof SVGSVGElement)) {
+      document.body.appendChild(element);
+      return;
+    }
+
+    const root = document.documentElement;
+    root.dataset.originalViewBox = root.getAttribute("viewBox") ?? "";
+    root.setAttribute("viewBox", "");
+
+    root.insertBefore(
+      parseElement(
+        `<style id="${SVG_STYLE_ID}" xmlns="http://www.w3.org/2000/svg">
+           :root { width: 100vw !important; height: 100vh !important; display: block !important; }
+           :root > :not(#${SVG_FOREIGN_OBJECT_ID}) { visibility: hidden !important; }
+         </style>`,
+      ),
+      root.firstChild,
+    );
+
+    const foreignObject = parseElement(
+      `<foreignObject id="${SVG_FOREIGN_OBJECT_ID}" xmlns="http://www.w3.org/2000/svg" x="0" y="0" width="100%" height="100%"></foreignObject>`,
+      "image/svg+xml",
+    );
+    foreignObject.appendChild(element);
+    root.appendChild(foreignObject);
+  }
+
+  async function render(tabList) {
+    // Fullscreen video would cover the overlay entirely.
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        /* not fatal — the overlay may just be hidden behind the fullscreen element */
+      }
+    }
+
+    if (!host) host = createHost();
+
+    const theme = THEMES[prefs.color] ?? THEMES[DEFAULT_PREFS.color];
+    overlay.style.setProperty("--color-main", theme.main);
+    overlay.style.setProperty("--color-thumbnail", theme.thumbBg);
+    overlay.style.setProperty("--color-overlay", theme.overlayBg);
+
+    const items = parseElement(
+      `<div>${tabList.map((tab, i) => itemMarkup(tab, i, selectedIndex)).join("")}</div>`,
+    );
+    overlay.replaceChildren(...Array.from(items.childNodes));
+
+    mountOverlay(host);
+    requestAnimationFrame(() => overlay?.classList.add("show"));
+
+    isOpen = true;
+    await setOverlayOpenFlag(true);
+  }
+
+  function highlight(index) {
+    selectedIndex = index;
+    Array.from(overlay?.children ?? []).forEach((child, i) =>
+      child.classList.toggle(CLASS.active, i === selectedIndex),
+    );
+  }
+
+  function hideOverlay() {
+    if (!isOpen) return;
+
+    overlay?.classList.remove("show");
+
+    if (host) {
+      if (document.documentElement instanceof SVGSVGElement) {
+        const root = document.documentElement;
+        if (root.dataset.originalViewBox) {
+          root.setAttribute("viewBox", root.dataset.originalViewBox);
+          delete root.dataset.originalViewBox;
+        }
+        // The style element was inserted into the SVG document, not the shadow root.
+        document.getElementById(SVG_STYLE_ID)?.remove();
+        host.parentElement?.remove();
+      }
+      host.remove();
+    }
+
+    // host/shadow/overlay are kept for reuse; only the DOM attachment is undone.
+    isOpen = false;
+    setOverlayOpenFlag(false);
+  }
+
+  function activateSelected() {
+    const tab = tabs[selectedIndex];
+    if (tab?.id) return sendToWorker({ type: "ACTIVATE_TAB", id: tab.id });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Events
+  // ---------------------------------------------------------------------------
+
+  async function onWorkerMessage(message) {
+    if (message.type === "OPEN_OVERLAY") await handleOpenOverlay(message);
+    else if (message.type === "RELEASED") await commitSelection();
+  }
+
+  async function handleOpenOverlay(message) {
+    if (!message.tabs?.length) return;
+
+    modifierKey = message.modifierKey ?? "Control";
+    prefs = message.prefs;
+
+    if (isOpen) {
+      // Already up: just move the highlight, wrapping in the requested direction.
+      highlight((selectedIndex + message.direction + tabs.length) % tabs.length);
+    } else {
+      const visible = message.tabs.slice(0, prefs.tabCount);
+      const currentIndex = visible.findIndex((tab) => tab.id === message.tabId);
+
+      // Opening from the tab you are on should preselect the *previous* tab, so a
+      // tap-and-release lands where Alt+Tab would.
+      selectedIndex = message.fromCurrentTab && currentIndex !== 1 ? 1 : 0;
+
+      tabs = await withThumbnails(visible, message.windowId);
+      await render(tabs);
+    }
+
+    overlay?.focus();
+  }
+
+  async function commitSelection() {
+    if (!isOpen) return;
+    hideOverlay();
+    await activateSelected();
+  }
+
+  /** Releasing the modifier commits, mirroring Alt+Tab. */
+  async function onKeyUp(event) {
+    if (event.key === modifierKey) await commitSelection();
+  }
+
+  function onKeyDown(event) {
+    if (event.key === modifierKey) return;
+    if (event.key === "Escape" && isOpen) {
+      hideOverlay();
+      // Stop the page from also acting on Escape (closing its own modal, etc).
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function onPointerDown(event) {
+    const closeButton = event.target.closest(`.${CLASS.close_button}`);
+    if (closeButton) {
+      closeTab(closeButton);
+      return;
+    }
+
+    const item = event.target.closest(`.${CLASS.item}`);
+    if (!item) return;
+
+    const index = Number(item.dataset.index);
+    if (index === 0) {
+      // Index 0 is the tab you are already on — just dismiss. The delay lets the
+      // click finish before the overlay is torn out from under it.
+      setTimeout(hideOverlay, 50);
+      return;
+    }
+
+    selectedIndex = index;
+    activateSelected();
+  }
+
+  async function closeTab(button) {
+    const tabId = Number(button.dataset.tabid);
+
+    try {
+      await sendToWorker({ type: "TRY_CLOSE_TAB", id: tabId });
+    } catch (error) {
+      // Leave the item in place if the tab would not close.
+      console.warn("Tab close error:", error);
+      return;
+    }
+
+    tabs = tabs.filter((tab) => tab.id !== tabId);
+    selectedIndex = Math.min(selectedIndex, tabs.length - 1);
+    await render(tabs);
+  }
+
+  function onClick(event) {
+    if (isOpen && !event.target.closest(`.${CLASS.overlay}`)) hideOverlay();
+  }
+
+  function onContextMenu(event) {
+    if (isOpen) event.preventDefault();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wiring
+  // ---------------------------------------------------------------------------
+
+  chrome.runtime.onMessage.addListener(onWorkerMessage);
+
+  // Capture phase: pages that swallow key events must not break the switcher.
+  window.addEventListener("keyup", onKeyUp, true);
+  window.addEventListener("keydown", onKeyDown, true);
+
+  // Losing focus or visibility means the switcher can no longer be driven — dismiss
+  // rather than stranding it on screen.
+  window.addEventListener("blur", hideOverlay);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) hideOverlay();
+  });
+
+  window.addEventListener("click", onClick);
+  document.addEventListener("contextmenu", onContextMenu);
+})();
