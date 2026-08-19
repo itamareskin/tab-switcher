@@ -35,6 +35,10 @@ Confirm at `chrome://extensions/shortcuts` that `Ctrl+Q` is bound (macOS: `MacCt
 physical Control key, not Command). Chrome sometimes leaves a suggested shortcut unassigned when
 another extension holds it.
 
+Want it on **`Ctrl+Tab`** instead? Chrome blocks that through the manifest and through the shortcuts
+UI, but not in the binding store itself — see [docs/ctrl-tab.md](docs/ctrl-tab.md). Do not put `Tab`
+in `manifest.json`; it is not a valid key there and the extension will fail to load.
+
 No build step. `src/` is loadable as-is — for 32 KB of dependency-free code, a toolchain would be
 more to maintain than it saves.
 
