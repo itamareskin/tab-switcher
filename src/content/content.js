@@ -10,10 +10,20 @@
  */
 
 (() => {
-  // Injected tabs can also receive the declared content script, which would double
-  // every listener. Cheap guard; the property lives in the isolated world, not the page.
-  if (window.__tabSwitcherLoaded) return;
-  window.__tabSwitcherLoaded = true;
+  // A tab can receive this script more than once: the declared content script plus the
+  // startup injection, and again after an extension update — where the previous
+  // instance's isolated world survives but its chrome.runtime listeners are dead.
+  //
+  // Tearing the old instance down rather than refusing to load handles both. A plain
+  // "already loaded, bail out" flag would make post-update re-injection a silent no-op
+  // and leave the tab permanently without a working switcher.
+  if (typeof window.__tabSwitcherTeardown === "function") {
+    try {
+      window.__tabSwitcherTeardown();
+    } catch {
+      /* previous instance's extension context is already invalidated */
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Constants
@@ -68,6 +78,8 @@
   let tabs = [];
   let selectedIndex = 0;
   let isOpen = false;
+  /** In-flight open, so a rapid second press advances the highlight instead of racing. */
+  let opening = null;
   let modifierKey = "Control";
   let prefs = DEFAULT_PREFS;
 
@@ -120,9 +132,17 @@
     return stored[windowId]?.thumbnails ?? [];
   }
 
-  /** Lets the worker skip screenshotting while the switcher itself is on screen. */
-  function setOverlayOpenFlag(value) {
-    return chrome.storage.session.set({ isOverlayOpen: value });
+  /**
+   * Lets the worker skip screenshotting while the switcher itself is on screen.
+   *
+   * Timestamped so the worker can expire it. If this document is torn down while the
+   * overlay is up (navigation, tab discard), the clearing write never happens, and an
+   * un-expiring flag would disable thumbnail capture for the whole browser session.
+   */
+  function setOverlayOpenFlag(open) {
+    return chrome.storage.session.set({
+      isOverlayOpen: { open, at: Date.now() },
+    });
   }
 
   async function withThumbnails(tabList, windowId) {
@@ -397,7 +417,12 @@
     }
 
     const root = document.documentElement;
-    root.dataset.originalViewBox = root.getAttribute("viewBox") ?? "";
+
+    // Only on the first mount. Re-running after the attribute has been blanked would
+    // save "" as the original and make the page's real viewBox unrecoverable.
+    if (!("originalViewBox" in root.dataset)) {
+      root.dataset.originalViewBox = root.getAttribute("viewBox") ?? "";
+    }
     root.setAttribute("viewBox", "");
 
     root.insertBefore(
@@ -440,7 +465,11 @@
     );
     overlay.replaceChildren(...Array.from(items.childNodes));
 
-    mountOverlay(host);
+    // Re-renders (closing a tab from the overlay) must not remount an attached host —
+    // in the SVG branch that would duplicate the foreignObject and clobber the saved
+    // viewBox.
+    if (!host.isConnected) mountOverlay(host);
+
     requestAnimationFrame(() => overlay?.classList.add("show"));
 
     isOpen = true;
@@ -462,7 +491,9 @@
     if (host) {
       if (document.documentElement instanceof SVGSVGElement) {
         const root = document.documentElement;
-        if (root.dataset.originalViewBox) {
+        // `in`, not truthiness: a document whose original viewBox was genuinely absent
+        // stores "" here, and that still needs restoring.
+        if ("originalViewBox" in root.dataset) {
           root.setAttribute("viewBox", root.dataset.originalViewBox);
           delete root.dataset.originalViewBox;
         }
@@ -498,19 +529,37 @@
     modifierKey = message.modifierKey ?? "Control";
     prefs = message.prefs;
 
+    // Opening is async (storage read, then render). A second Ctrl+Q arriving inside
+    // that window would otherwise take the "not open yet" branch and restart the
+    // overlay instead of advancing the highlight, losing the keypress.
+    if (opening) {
+      await opening;
+      highlight((selectedIndex + message.direction + tabs.length) % tabs.length);
+      overlay?.focus();
+      return;
+    }
+
     if (isOpen) {
       // Already up: just move the highlight, wrapping in the requested direction.
       highlight((selectedIndex + message.direction + tabs.length) % tabs.length);
     } else {
-      const visible = message.tabs.slice(0, prefs.tabCount);
-      const currentIndex = visible.findIndex((tab) => tab.id === message.tabId);
+      opening = (async () => {
+        const visible = message.tabs.slice(0, prefs.tabCount);
+        const currentIndex = visible.findIndex((tab) => tab.id === message.tabId);
 
-      // Opening from the tab you are on should preselect the *previous* tab, so a
-      // tap-and-release lands where Alt+Tab would.
-      selectedIndex = message.fromCurrentTab && currentIndex !== 1 ? 1 : 0;
+        // Opening from the tab you are on should preselect the *previous* tab, so a
+        // tap-and-release lands where Alt+Tab would.
+        selectedIndex = message.fromCurrentTab && currentIndex !== 1 ? 1 : 0;
 
-      tabs = await withThumbnails(visible, message.windowId);
-      await render(tabs);
+        tabs = await withThumbnails(visible, message.windowId);
+        await render(tabs);
+      })();
+
+      try {
+        await opening;
+      } finally {
+        opening = null;
+      }
     }
 
     overlay?.focus();
@@ -561,21 +610,42 @@
   async function closeTab(button) {
     const tabId = Number(button.dataset.tabid);
 
+    let response;
     try {
-      await sendToWorker({ type: "TRY_CLOSE_TAB", id: tabId });
+      response = await sendToWorker({ type: "TRY_CLOSE_TAB", id: tabId });
     } catch (error) {
       // Leave the item in place if the tab would not close.
       console.warn("Tab close error:", error);
       return;
     }
+    // The worker reports failure in the payload, not by rejecting.
+    if (!response?.ok) {
+      console.warn("Tab close error:", response?.error);
+      return;
+    }
 
+    // Removing an entry *before* the highlight shifts everything after it down by one.
+    // Clamping alone would leave the highlight pointing at a different tab than the one
+    // the user is looking at — and releasing the modifier would switch to it.
+    const removedIndex = tabs.findIndex((tab) => tab.id === tabId);
     tabs = tabs.filter((tab) => tab.id !== tabId);
-    selectedIndex = Math.min(selectedIndex, tabs.length - 1);
+
+    if (removedIndex !== -1 && removedIndex < selectedIndex) selectedIndex -= 1;
+    selectedIndex = Math.max(0, Math.min(selectedIndex, tabs.length - 1));
+
     await render(tabs);
   }
 
+  /**
+   * Dismiss on a click outside the switcher.
+   *
+   * The test is against the shadow *host*, not `.overlay`. This listener is on window,
+   * outside the shadow tree, so shadow-DOM retargeting rewrites event.target to the host
+   * container for any click inside the overlay — a `.overlay` selector never matches and
+   * the guard would dismiss on every click, including our own.
+   */
   function onClick(event) {
-    if (isOpen && !event.target.closest(`.${CLASS.overlay}`)) hideOverlay();
+    if (isOpen && event.target !== host) hideOverlay();
   }
 
   function onContextMenu(event) {
@@ -586,6 +656,14 @@
   // Wiring
   // ---------------------------------------------------------------------------
 
+  function onBlur() {
+    hideOverlay();
+  }
+
+  function onVisibilityChange() {
+    if (document.hidden) hideOverlay();
+  }
+
   chrome.runtime.onMessage.addListener(onWorkerMessage);
 
   // Capture phase: pages that swallow key events must not break the switcher.
@@ -594,11 +672,24 @@
 
   // Losing focus or visibility means the switcher can no longer be driven — dismiss
   // rather than stranding it on screen.
-  window.addEventListener("blur", hideOverlay);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) hideOverlay();
-  });
+  window.addEventListener("blur", onBlur);
+  document.addEventListener("visibilitychange", onVisibilityChange);
 
   window.addEventListener("click", onClick);
   document.addEventListener("contextmenu", onContextMenu);
+
+  /**
+   * Unregister everything this instance owns, so a later injection into the same
+   * isolated world can take over cleanly. Called by the next instance, not by us.
+   */
+  window.__tabSwitcherTeardown = () => {
+    chrome.runtime.onMessage.removeListener(onWorkerMessage);
+    window.removeEventListener("keyup", onKeyUp, true);
+    window.removeEventListener("keydown", onKeyDown, true);
+    window.removeEventListener("blur", onBlur);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("click", onClick);
+    document.removeEventListener("contextmenu", onContextMenu);
+    host?.remove();
+  };
 })();

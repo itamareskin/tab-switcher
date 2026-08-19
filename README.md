@@ -75,10 +75,38 @@ readability.
 
 **Correctness**
 
-- Re-entry guard in the content script. Upstream registered a second set of listeners if a tab
-  received both the declared content script and the startup injection.
+Mostly bugs inherited from upstream, found while porting or during review.
+
+- **Highlight no longer slides after closing a tab.** Closing an entry *above* the highlight shifted
+  everything down but only clamped `selectedIndex`, so releasing the modifier switched to a
+  different tab than the highlighted one.
+- **`onMessage` returns `true` instead of a Promise.** Chrome ignores a returned Promise, so the
+  reply channel closed immediately, the content script's close-failure handling was dead code, and
+  worker rejections went unhandled. The worker now replies `{ok}` explicitly.
+- **Screenshots are scoped to the right window.** Capture resolved the window via
+  `chrome.windows.getCurrent()` (the *focused* one) while the tab id came from `onActivated`, which
+  fires for background windows too — so activity in a background window could screenshot the
+  foreground one and file it under the wrong tab.
+- **The "overlay is open" flag expires.** It suppresses screenshotting while the switcher is up, but
+  a page torn down mid-overlay never cleared it, silently disabling thumbnails for the rest of the
+  browser session. Now timestamped and expired after 15s.
+- **Re-injection after an extension update works.** The content script tears down a previous
+  instance rather than bailing out on an "already loaded" flag — the isolated world survives an
+  update while its `chrome.runtime` listeners do not, so bailing out would leave every open tab
+  without a working switcher.
+- **Outside-click dismissal actually works.** The guard tested `event.target.closest('.overlay')`
+  from a window listener, but shadow-DOM retargeting rewrites the target to the host, so it never
+  matched. Now compared against the host.
+- **Rapid `Ctrl+Q` presses no longer race.** A second press arriving while the first was still
+  awaiting storage restarted the overlay instead of advancing the highlight.
+- **SVG documents recover their `viewBox`.** Re-rendering remounted the overlay and re-saved an
+  already-blanked `viewBox`, permanently breaking the page's scale.
+- **Blank shortcut pill fixed.** `chrome.commands` reports an unassigned command as `""`, so the
+  `??` fallback never fired.
 - Dropped a `chrome.windows.getCurrent()` fallback in the content script — that API is unavailable
   to content scripts, so the branch could only ever have thrown.
+- Dropped tracked `activeTabId` module state; an MV3 worker is terminated after ~30s idle, so it was
+  reset to 0 between events. The active tab is now queried live.
 - `chrome.action.openPopup()` moved ahead of the `await`s in the install handler, where it is still
   honoured.
 - Theme lookup falls back to the default instead of throwing on an unrecognised colour.
@@ -93,7 +121,8 @@ The greps behind the audit, to run yourself:
 # No network egress anywhere in the fork
 grep -rnE 'fetch\(|XMLHttpRequest|sendBeacon|WebSocket|EventSource|importScripts' src/
 
-# No dynamic code execution
+# No dynamic code execution (the only hit should be the comment in content.js
+# explaining why DOMParser is used instead of innerHTML)
 grep -rnE '\beval\(|new Function|document\.write|innerHTML|insertAdjacentHTML' src/
 
 # Every URL literal (the only hits should be Web Store classification and SVG namespaces)

@@ -54,8 +54,14 @@ const DEFAULT_PREFS = {
  */
 const THUMBNAIL_OVERSCAN = 1.5;
 
-/** Tab the user is actually looking at. Tracked so we never screenshot a background tab. */
-let activeTabId = 0;
+/**
+ * How long the content script's "overlay is open" flag is trusted.
+ *
+ * The flag is set by the overlay and cleared when it closes, but a page torn down
+ * mid-overlay (navigation, discard) never runs the clear. Without an expiry that
+ * would disable thumbnail capture for the rest of the browser session.
+ */
+const OVERLAY_FLAG_TTL_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // Tab classification
@@ -134,7 +140,8 @@ async function getPrefs() {
   const shortcut = await getShortcut();
 
   return {
-    shortcut: shortcut ?? DEFAULT_PREFS.shortcut,
+    // `||`, not `??`: an unassigned command is reported as "", not null.
+    shortcut: shortcut || DEFAULT_PREFS.shortcut,
     color: stored.color ?? DEFAULT_PREFS.color,
     layout: stored.layout ?? DEFAULT_PREFS.layout,
     tabCount: stored.tabCount ?? DEFAULT_PREFS.tabCount,
@@ -199,22 +206,22 @@ async function buildTabList() {
  * Read the session-storage bucket for a window. Keyed by window id so two windows
  * do not show each other's thumbnails.
  *
+ * The window id is always passed explicitly. Resolving it here via
+ * chrome.windows.getCurrent() would return the *focused* window, which is not
+ * necessarily the window the tab being captured belongs to.
+ *
  * @returns {[string, {thumbnails: Array<{tabId: number, thumbnail: string}>}|undefined]}
  */
 async function getWindowBucket(windowId) {
-  if (!windowId) {
-    const current = await chrome.windows.getCurrent();
-    windowId = current.id.toString();
-  }
-  const stored = await chrome.storage.session.get(windowId);
-  return [windowId, stored[windowId]];
+  const key = windowId.toString();
+  const stored = await chrome.storage.session.get(key);
+  return [key, stored[key]];
 }
 
 /** Quality 10 JPEG: these are 140px-wide previews, so the loss is invisible and the bytes matter. */
-async function captureScreenshot() {
+async function captureScreenshot(windowId) {
   try {
-    const window = await chrome.windows.getCurrent();
-    return await chrome.tabs.captureVisibleTab(window.id, {
+    return await chrome.tabs.captureVisibleTab(windowId, {
       format: "jpeg",
       quality: 10,
     });
@@ -226,8 +233,8 @@ async function captureScreenshot() {
 }
 
 /** Store a thumbnail, most-recent-first, evicting the oldest past the overscan limit. */
-async function setThumbnail(tabId, dataUrl) {
-  const [key, bucket] = await getWindowBucket();
+async function setThumbnail(tabId, dataUrl, windowId) {
+  const [key, bucket] = await getWindowBucket(windowId);
   const { tabCount } = await getPrefs();
 
   const thumbnails = bucket?.thumbnails ?? [];
@@ -243,20 +250,35 @@ async function setThumbnail(tabId, dataUrl) {
   return chrome.storage.session.set({ [key]: { thumbnails } });
 }
 
+/**
+ * Whether an overlay is currently on screen anywhere.
+ *
+ * Treated as closed once the flag goes stale — see OVERLAY_FLAG_TTL_MS. Erring
+ * towards "closed" costs at most one screenshot of the switcher; erring the other
+ * way silently kills thumbnail capture until the browser restarts.
+ */
 async function isOverlayOpen() {
-  const stored = await chrome.storage.session.get("isOverlayOpen");
-  return stored.isOverlayOpen ?? false;
+  const { isOverlayOpen: flag } = await chrome.storage.session.get("isOverlayOpen");
+  if (!flag?.open) return false;
+  return Date.now() - (flag.at ?? 0) < OVERLAY_FLAG_TTL_MS;
 }
 
 /**
  * Capture the given tab, but only if it is genuinely what the user is looking at and
  * the overlay is not up — otherwise we would photograph the switcher itself.
+ *
+ * The "is it active" test is a live query rather than tracked module state: an MV3
+ * service worker is terminated after roughly 30s idle, so anything held in a module
+ * variable is gone by the next event.
  */
-async function captureThumbnailFor(tabId) {
-  if (activeTabId !== tabId || (await isOverlayOpen())) return;
+async function captureThumbnailFor(tabId, windowId) {
+  const [active] = await chrome.tabs.query({ active: true, windowId });
+  if (active?.id !== tabId) return;
 
-  const screenshot = await captureScreenshot();
-  if (screenshot) await setThumbnail(tabId, screenshot);
+  if (await isOverlayOpen()) return;
+
+  const screenshot = await captureScreenshot(windowId);
+  if (screenshot) await setThumbnail(tabId, screenshot, windowId);
 }
 
 // ---------------------------------------------------------------------------
@@ -387,30 +409,42 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
   await initialize();
 
   const tab = await getActiveTab();
-  activeTabId = tab?.id ?? 0;
-  await captureThumbnailFor(activeTabId);
+  if (tab?.id) await captureThumbnailFor(tab.id, tab.windowId);
 });
 
 chrome.runtime.onStartup.addListener(initialize);
 
-chrome.tabs.onActivated.addListener(async ({ tabId }) => {
-  const tab = await chrome.tabs.get(tabId);
-  if (!tab.id) return;
-
-  activeTabId = tab.id;
-  await captureThumbnailFor(tabId);
+// windowId comes from the event: onActivated fires for background windows too, so
+// capturing "the current window" here would photograph the wrong one.
+chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  await captureThumbnailFor(tabId, windowId);
 });
 
 // Re-capture once a page finishes loading, so the thumbnail is not of a blank page.
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (tabId === activeTabId && changeInfo.status === "complete") {
-    await captureThumbnailFor(tabId);
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete") {
+    await captureThumbnailFor(tabId, tab.windowId);
   }
 });
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === "ACTIVATE_TAB") return activateTab(message.id);
-  if (message.type === "TRY_CLOSE_TAB") return chrome.tabs.remove(message.id);
+/**
+ * Chrome ignores a Promise returned from an onMessage listener — only `return true`
+ * keeps the channel open. Without it the caller's await resolves immediately with
+ * undefined, so the content script cannot tell a failed tab close from a successful
+ * one, and rejections here surface as unhandled.
+ */
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  const handle = async () => {
+    if (message.type === "ACTIVATE_TAB") return activateTab(message.id);
+    if (message.type === "TRY_CLOSE_TAB") return chrome.tabs.remove(message.id);
+  };
+
+  handle().then(
+    () => sendResponse({ ok: true }),
+    (error) => sendResponse({ ok: false, error: String(error) }),
+  );
+
+  return true;
 });
 
 chrome.commands.onCommand.addListener(async (command) => {

@@ -29,7 +29,9 @@ async function loadPrefs() {
   const shortcut = await getShortcut();
 
   return {
-    shortcut: shortcut ?? DEFAULT_PREFS.shortcut,
+    // `||`, not `??`: chrome.commands reports an unassigned command as "", which is
+    // not nullish, so `??` would render an empty shortcut pill.
+    shortcut: shortcut || DEFAULT_PREFS.shortcut,
     color: stored.color ?? DEFAULT_PREFS.color,
     layout: stored.layout ?? DEFAULT_PREFS.layout,
     tabCount: stored.tabCount ?? DEFAULT_PREFS.tabCount,
