@@ -30,14 +30,20 @@ this extension — it is documented publicly by
 ```js
 const id = "YOUR_EXTENSION_ID";
 
+// Always pass the callback and read lastError. This API reports rejection there,
+// not by throwing — without it a refused binding fails silently and simply
+// leaves the shortcut empty, which looks identical to "nothing happened".
+const bind = (commandName, keybinding) =>
+  chrome.developerPrivate.updateExtensionCommand(
+    { extensionId: id, commandName, keybinding },
+    () => console.log(commandName, "->", keybinding, ":",
+                      chrome.runtime.lastError?.message ?? "ok"),
+  );
+
 // macOS: MacCtrl is the real Control key. Plain "Ctrl" is remapped to Command,
 // which macOS itself intercepts for the app switcher — that binding would never fire.
-chrome.developerPrivate.updateExtensionCommand({
-  extensionId: id, commandName: "next-tab", keybinding: "MacCtrl+Tab",
-});
-chrome.developerPrivate.updateExtensionCommand({
-  extensionId: id, commandName: "prev-tab", keybinding: "MacCtrl+Shift+Tab",
-});
+bind("next-tab", "MacCtrl+Tab");
+bind("prev-tab", "MacCtrl+Shift+Tab");
 ```
 
 On Windows or Linux use `Ctrl+Tab` and `Ctrl+Shift+Tab` instead.
@@ -75,3 +81,28 @@ happen while you are still sitting on the extensions page — that is not a fail
   should consume it in dispatching the command, but if it leaks through, focus may move underneath
   the overlay. Worth watching the first time you use it; if it happens, the fix is a
   `preventDefault()` for `Tab` in `onKeyDown` while `isOpen`.
+
+## Troubleshooting
+
+**`chrome.commands.getAll()` shows an empty `shortcut`.** The command exists but has no key bound.
+Either the rebind above was refused, or Chrome never assigned the manifest default in the first
+place (it silently skips a suggested key that conflicts with an existing binding).
+
+Distinguish the two — run on `chrome://extensions/shortcuts` with DevTools open:
+
+```js
+chrome.developerPrivate.getExtensionsInfo({ includeDisabled: true }, (list) => {
+  const e = list.find((x) => x.name.includes("Tab Switcher"));
+  console.log(e ? `${e.name}  id=${e.id}` : "extension not found");
+  console.table((e?.commands ?? []).map((c) => ({
+    name: c.name, keybinding: c.keybinding, isActive: c.isActive, scope: c.scope,
+  })));
+});
+```
+
+That prints the ID (so you can confirm you used the right one) and Chrome's own view of each
+command. Then re-run the `bind()` calls above and read the logged result — `ok`, or the reason.
+
+If the API refuses `Tab` outright, the technique does not work on your Chrome version and the
+shortcut has to be one of the keys the `commands` API allows. Assigning it by hand in the shortcuts
+UI always works as a fallback: click the field for the command and press the combination.
