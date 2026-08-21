@@ -111,6 +111,11 @@ thumbCount.addEventListener("input", () => {
   save();
 });
 
+// Chrome fires no event when a shortcut is rebound at chrome://extensions/shortcuts,
+// so opening this popup is the cue for the worker to re-read them and republish the
+// keydown matchers the in-page fallback uses.
+chrome.runtime.sendMessage({ type: "REFRESH_HOTKEYS" });
+
 loadPrefs().then((stored) => {
   prefs.color = stored.color;
   prefs.layout = stored.layout;

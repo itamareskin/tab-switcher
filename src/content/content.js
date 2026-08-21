@@ -82,6 +82,8 @@
   let opening = null;
   let modifierKey = "Control";
   let prefs = DEFAULT_PREFS;
+  /** Keydown matchers for each command, published by the worker. See matchesHotkey(). */
+  let hotkeys = { "next-tab": null, "prev-tab": null };
 
   /**
    * The shadow root is closed, so `host.shadowRoot` is null even to us. These
@@ -120,6 +122,47 @@
 
   function sendToWorker(message) {
     return chrome.runtime.sendMessage(message);
+  }
+
+  /**
+   * Does this keydown match one of our shortcuts?
+   *
+   * This is the in-page fallback for Chrome's own accelerator, and it exists because
+   * Chrome matches a shortcut against the *character* the active keyboard layout
+   * produces. Bind Ctrl+Q under a Latin layout, switch the input language to one where
+   * that key types something else — Hebrew, Russian, Greek — and Chrome stops seeing
+   * Ctrl+Q, so the command never fires.
+   *
+   * KeyboardEvent.code is the physical key position and does not change with the
+   * layout, so matching on it keeps the shortcut working in every language. It also
+   * covers a command Chrome left unbound because another extension claimed the
+   * combination.
+   *
+   * Modifiers are compared for equality, not just presence, so Ctrl+Shift+Q cannot also
+   * satisfy Ctrl+Q. When both this and Chrome's accelerator fire for one keypress, the
+   * worker collapses the duplicate.
+   */
+  function matchesHotkey(event, matcher) {
+    return (
+      !!matcher &&
+      event.code === matcher.code &&
+      event.ctrlKey === matcher.ctrl &&
+      event.altKey === matcher.alt &&
+      event.shiftKey === matcher.shift &&
+      event.metaKey === matcher.meta
+    );
+  }
+
+  async function loadHotkeys() {
+    const stored = await chrome.storage.session.get("hotkeys");
+    if (stored.hotkeys) {
+      hotkeys = stored.hotkeys;
+      return;
+    }
+
+    // Session storage is empty at browser start, and after an unpacked reload the
+    // worker may not have republished yet. Ask; onStorageChanged delivers the answer.
+    await sendToWorker({ type: "REFRESH_HOTKEYS" });
   }
 
   /**
@@ -577,6 +620,17 @@
   }
 
   function onKeyDown(event) {
+    // Skip auto-repeat: holding the key down should not cycle on its own.
+    if (!event.repeat) {
+      for (const command of ["prev-tab", "next-tab"]) {
+        if (!matchesHotkey(event, hotkeys[command])) continue;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        sendToWorker({ type: "TRIGGER", command });
+        return;
+      }
+    }
+
     if (event.key === modifierKey) return;
     if (event.key === "Escape" && isOpen) {
       hideOverlay();
@@ -664,7 +718,16 @@
     if (document.hidden) hideOverlay();
   }
 
+  /** The worker republishes matchers when the shortcut may have changed. */
+  function onStorageChanged(changes, area) {
+    if (area === "session" && changes.hotkeys) {
+      hotkeys = changes.hotkeys.newValue ?? hotkeys;
+    }
+  }
+
   chrome.runtime.onMessage.addListener(onWorkerMessage);
+  chrome.storage.onChanged.addListener(onStorageChanged);
+  loadHotkeys().catch((error) => console.warn("Failed to read shortcuts", error));
 
   // Capture phase: pages that swallow key events must not break the switcher.
   window.addEventListener("keyup", onKeyUp, true);
@@ -684,6 +747,7 @@
    */
   window.__tabSwitcherTeardown = () => {
     chrome.runtime.onMessage.removeListener(onWorkerMessage);
+    chrome.storage.onChanged.removeListener(onStorageChanged);
     window.removeEventListener("keyup", onKeyUp, true);
     window.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("blur", onBlur);

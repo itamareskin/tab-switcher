@@ -11,22 +11,51 @@
  * in which case we have to switch to a tab that can host the overlay first.
  */
 
-/** Chrome reports shortcuts as display strings; map the first chunk to a KeyboardEvent.key. */
-const MODIFIER_KEYS = {
-  Ctrl: "Control",
-  Control: "Control",
-  Alt: "Alt",
-  Option: "Alt",
-  Shift: "Shift",
-  Command: "Meta",
-  Meta: "Meta",
-  Win: "Meta",
-  "⊞": "Meta",
-  "⌃": "Control",
-  "⌥": "Alt",
-  "⇧": "Shift",
-  "⌘": "Meta",
+/**
+ * Modifier names as they appear in a shortcut string, mapped to the flag a
+ * KeyboardEvent carries.
+ *
+ * `Ctrl` is deliberately absent: it means Command on macOS and Control everywhere
+ * else, so it is resolved per-platform in parseShortcut(). `MacCtrl` is how a manifest
+ * asks for the physical Control key on a Mac. The macOS display glyphs are unambiguous
+ * and map directly.
+ */
+const SHORTCUT_MODIFIERS = {
+  Control: "ctrl",
+  MacCtrl: "ctrl",
+  Alt: "alt",
+  Option: "alt",
+  Shift: "shift",
+  Command: "meta",
+  Meta: "meta",
+  Win: "meta",
+  Search: "meta",
+  "⊞": "meta",
+  "⌃": "ctrl",
+  "⌥": "alt",
+  "⇧": "shift",
+  "⌘": "meta",
 };
+
+/** Non-alphanumeric shortcut key names, mapped to their KeyboardEvent.code. */
+const SHORTCUT_CODES = {
+  Comma: "Comma",
+  Period: "Period",
+  Space: "Space",
+  Home: "Home",
+  End: "End",
+  Insert: "Insert",
+  Delete: "Delete",
+  PageUp: "PageUp",
+  PageDown: "PageDown",
+  Up: "ArrowUp",
+  Down: "ArrowDown",
+  Left: "ArrowLeft",
+  Right: "ArrowRight",
+};
+
+/** KeyboardEvent.key for each modifier flag, for the hold-to-cycle release test. */
+const MODIFIER_EVENT_KEYS = { meta: "Meta", ctrl: "Control", alt: "Alt" };
 
 /** Internal pages we ship a recognisable icon for; anything else falls back to "unknown". */
 const KNOWN_INTERNAL_PAGES = new Set([
@@ -119,20 +148,96 @@ async function getShortcut() {
   return commands.find((command) => command.name === "next-tab")?.shortcut;
 }
 
+/** KeyboardEvent.code for a shortcut's key, or null if it has no in-page equivalent. */
+function shortcutKeyToCode(key) {
+  if (/^[A-Za-z]$/.test(key)) return `Key${key.toUpperCase()}`;
+  if (/^[0-9]$/.test(key)) return `Digit${key}`;
+  return SHORTCUT_CODES[key] ?? null;
+}
+
 /**
- * The modifier the user must keep held for the switcher to stay open. Derived from
- * the bound shortcut, so rebinding to e.g. Alt+E keeps the hold-to-cycle behaviour.
+ * Turn a shortcut string into a matcher that a keydown can be tested against.
+ *
+ * The key is reduced to a KeyboardEvent.code — a physical key *position* rather than
+ * the character it produces. That is the point: `code` is "KeyQ" for the Q key whatever
+ * the active input language types with it.
+ *
+ * @returns {{code: string, ctrl: boolean, alt: boolean, shift: boolean, meta: boolean}|null}
  */
-async function getModifierKey() {
-  const shortcut = await getShortcut();
+function parseShortcut(shortcut, isMac) {
   if (!shortcut) return null;
 
   // "Ctrl+Q" -> ["Ctrl","Q"], but macOS reports glyph runs like "⌃Q" with no separator.
   const parts = shortcut.includes("+")
     ? shortcut.split("+").map((part) => part.trim())
-    : shortcut.split("");
+    : [...shortcut];
 
-  return MODIFIER_KEYS[parts[0]] ?? null;
+  // Media keys and anything unrecognised have no keydown equivalent — no fallback there.
+  const code = shortcutKeyToCode(parts.pop() ?? "");
+  if (!code) return null;
+
+  const matcher = { code, ctrl: false, alt: false, shift: false, meta: false };
+  for (const part of parts) {
+    const flag = part === "Ctrl" ? (isMac ? "meta" : "ctrl") : SHORTCUT_MODIFIERS[part];
+    if (!flag) return null;
+    matcher[flag] = true;
+  }
+
+  // Shift alone would fire while typing.
+  if (!matcher.ctrl && !matcher.alt && !matcher.meta) return null;
+
+  return matcher;
+}
+
+/**
+ * Matchers for both commands: what is actually bound, falling back to what the manifest
+ * suggested.
+ *
+ * The fallback earns its place — Chrome silently drops a suggested shortcut that another
+ * extension already claims, leaving the command bound to nothing at all.
+ */
+async function buildHotkeys() {
+  const [{ os }, commands] = await Promise.all([
+    chrome.runtime.getPlatformInfo(),
+    chrome.commands.getAll(),
+  ]);
+  const isMac = os === "mac";
+  const declared = chrome.runtime.getManifest().commands ?? {};
+
+  const forCommand = (name) => {
+    const bound = commands.find((command) => command.name === name)?.shortcut;
+    const suggested = declared[name]?.suggested_key ?? {};
+    return (
+      parseShortcut(bound, isMac) ??
+      parseShortcut(isMac ? (suggested.mac ?? suggested.default) : suggested.default, isMac)
+    );
+  };
+
+  return { "next-tab": forCommand("next-tab"), "prev-tab": forCommand("prev-tab") };
+}
+
+/**
+ * Publish the matchers where content scripts can read them.
+ *
+ * Session storage rather than a message: a content script reads it directly without
+ * waking this worker, and chrome.storage.onChanged pushes later edits to every open tab.
+ * Chrome fires no event when a shortcut is rebound, so this is refreshed at startup and
+ * whenever the popup is opened.
+ */
+async function publishHotkeys() {
+  return chrome.storage.session.set({ hotkeys: await buildHotkeys() });
+}
+
+/**
+ * The modifier the user must keep held for the switcher to stay open. Derived from the
+ * bound shortcut, so rebinding to e.g. Alt+E keeps the hold-to-cycle behaviour.
+ */
+async function getModifierKey() {
+  const next = (await buildHotkeys())["next-tab"];
+  if (!next) return null;
+
+  const flag = ["meta", "ctrl", "alt"].find((name) => next[name]);
+  return MODIFIER_EVENT_KEYS[flag] ?? null;
 }
 
 async function getPrefs() {
@@ -393,6 +498,7 @@ async function initialize() {
   await chrome.storage.session.setAccessLevel({
     accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS",
   });
+  await publishHotkeys();
   await injectIntoOpenTabs();
 }
 
@@ -437,6 +543,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const handle = async () => {
     if (message.type === "ACTIVATE_TAB") return activateTab(message.id);
     if (message.type === "TRY_CLOSE_TAB") return chrome.tabs.remove(message.id);
+    // Only our own content scripts and popup can reach this: with no
+    // externally_connectable, page scripts cannot message the extension at all.
+    if (message.type === "TRIGGER") return handleTrigger(message.command);
+    if (message.type === "REFRESH_HOTKEYS") return publishHotkeys();
   };
 
   handle().then(
@@ -447,8 +557,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-chrome.commands.onCommand.addListener(async (command) => {
+/**
+ * Two things can trigger the switcher: Chrome's own accelerator, and the content
+ * script's in-page fallback for when that accelerator does not fire. Where both work,
+ * one keypress produces both — a millisecond or two apart, where a genuine second tap
+ * is 100ms away at best. So a short suppression window separates them reliably.
+ */
+const TRIGGER_DEDUP_MS = 50;
+let lastTrigger = { command: null, at: 0 };
+
+function isDuplicateTrigger(command) {
+  const now = Date.now();
+  // Deliberately not restamped on a duplicate: the window must stay anchored to the
+  // original keypress, or a stream of duplicates would keep pushing it forward.
+  if (command === lastTrigger.command && now - lastTrigger.at < TRIGGER_DEDUP_MS) {
+    return true;
+  }
+
+  lastTrigger = { command, at: now };
+  return false;
+}
+
+async function handleTrigger(command) {
   if (command !== "next-tab" && command !== "prev-tab") return;
+  if (isDuplicateTrigger(command)) return;
 
   const currentTab = await getActiveTab();
   if (!currentTab) return;
@@ -469,4 +601,6 @@ chrome.commands.onCommand.addListener(async (command) => {
     const target = tabs.find((tab) => tab.id !== currentTab.id);
     if (target) await activateTab(target.id);
   }
-});
+}
+
+chrome.commands.onCommand.addListener(handleTrigger);

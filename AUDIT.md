@@ -171,6 +171,18 @@ thumbnails and nothing else; the switcher falls back to favicons.
 ## Limits of this review
 
 Static review of one snapshot. It says nothing about any other version, and a clean read is not a
-formal proof of absence. It was corroborated at runtime by watching DevTools Network on both the
-service worker and a page while exercising the switcher (zero requests) — see `README.md` for how to
-repeat that check yourself.
+formal proof of absence.
+
+**It has not yet been corroborated at runtime.** The switcher has never been exercised with DevTools
+Network open on the service worker and on a page, so the "zero outbound requests" claim rests on
+reading alone. `README.md` has the procedure; it is still outstanding.
+
+This review covers `vendor/tab-flick-0.2.0/` and the port of it in `src/`. Code added to the fork
+*after* the review is out of scope and called out here as it lands:
+
+- **In-page shortcut fallback** (`matchesHotkey`/`onKeyDown` in `src/content/content.js`, the
+  `TRIGGER` message in `src/background.js`). Adds one message type the content script can send. It
+  is not new attack surface from the page's side: with no `externally_connectable`, page scripts
+  cannot message the extension at all, and the worker only ever acts on the two command names it
+  already accepted from `chrome.commands`. It does mean the content script now calls
+  `preventDefault()` on a key combination the page would otherwise receive.
