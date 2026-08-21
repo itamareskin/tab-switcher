@@ -221,11 +221,35 @@ async function buildHotkeys() {
  *
  * Session storage rather than a message: a content script reads it directly without
  * waking this worker, and chrome.storage.onChanged pushes later edits to every open tab.
- * Chrome fires no event when a shortcut is rebound, so this is refreshed at startup and
- * whenever the popup is opened.
+ * Chrome fires no event when a shortcut is rebound, so this is refreshed on every worker
+ * wake and whenever the popup is opened.
+ *
+ * Only written when it changed: a set() notifies every open tab, and this runs often.
  */
 async function publishHotkeys() {
-  return chrome.storage.session.set({ hotkeys: await buildHotkeys() });
+  const current = await buildHotkeys();
+  const { hotkeys } = await chrome.storage.session.get("hotkeys");
+  if (JSON.stringify(hotkeys) === JSON.stringify(current)) return;
+
+  return chrome.storage.session.set({ hotkeys: current });
+}
+
+/**
+ * Session state that must exist for *any* worker wake, not just install and startup.
+ *
+ * A content script cannot read session storage at all until the access level is set, and
+ * it needs the matchers before the first keypress. Reloading an unpacked extension does
+ * not reliably fire onInstalled, so hanging these off install/startup alone leaves both
+ * thumbnails and the in-page shortcut dead until the next browser restart — with the
+ * content script's storage read throwing rather than returning empty.
+ */
+async function ensureSessionSetup() {
+  // Content scripts count as an untrusted context. Still unreachable from page
+  // JavaScript, which has no access to chrome.storage at all.
+  await chrome.storage.session.setAccessLevel({
+    accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS",
+  });
+  await publishHotkeys();
 }
 
 /**
@@ -492,13 +516,7 @@ async function injectIntoOpenTabs() {
 }
 
 async function initialize() {
-  // Content scripts count as an untrusted context; without this they cannot read the
-  // thumbnails they need to render. Still unreachable from page JavaScript, which has
-  // no access to chrome.storage at all.
-  await chrome.storage.session.setAccessLevel({
-    accessLevel: "TRUSTED_AND_UNTRUSTED_CONTEXTS",
-  });
-  await publishHotkeys();
+  await ensureSessionSetup();
   await injectIntoOpenTabs();
 }
 
@@ -519,6 +537,9 @@ chrome.runtime.onInstalled.addListener(async ({ reason }) => {
 });
 
 chrome.runtime.onStartup.addListener(initialize);
+
+// Not just on those two events — see ensureSessionSetup().
+ensureSessionSetup().catch((error) => console.warn("Session setup failed", error));
 
 // windowId comes from the event: onActivated fires for background windows too, so
 // capturing "the current window" here would photograph the wrong one.
