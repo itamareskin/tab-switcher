@@ -77,6 +77,12 @@ Prefer to avoid the whole problem instead? Bind a key that is identical in every
 macOS: it is the system shortcut for switching input source, which is the very thing you would be
 switching.
 
+**Reload your open tabs after reloading the extension.** Tabs keep running the content script from
+the version that was loaded when they were opened, and reloading the extension leaves those
+instances alive but unable to talk to the service worker. They now detect that and unhook
+themselves, so the page behaves normally — but the switcher does not work in those tabs until they
+are reloaded.
+
 No build step. `src/` is loadable as-is — for 32 KB of dependency-free code, a toolchain would be
 more to maintain than it saves.
 
