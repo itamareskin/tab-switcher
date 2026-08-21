@@ -37,8 +37,43 @@ another extension holds it.
 
 Chrome will silently skip a suggested shortcut that another extension already claims, leaving the
 command unbound — if `chrome.commands.getAll()` reports an empty `shortcut`, assign it by hand in
-that UI. Wanted **`Ctrl+Tab`**? It is not achievable; [docs/ctrl-tab.md](docs/ctrl-tab.md) records
-what was tried and why.
+that UI. On ordinary web pages the in-page fallback below covers that case anyway, but binding it
+properly is what makes the shortcut work on the new tab page and other internal pages.
+
+Wanted **`Ctrl+Tab`**? It is not achievable; [docs/ctrl-tab.md](docs/ctrl-tab.md) records what was
+tried and why.
+
+## Keyboard layouts
+
+Chrome matches its shortcut accelerators against the *character* the active keyboard layout
+produces. Bind `Ctrl+Q` while typing English, switch your input language to Hebrew, Russian, Greek,
+or anything else that does not put `q` on that key, and Chrome no longer sees `Ctrl+Q` — the command
+simply stops firing.
+
+This fork works around that. Alongside Chrome's accelerator, the content script watches for the same
+combination using `KeyboardEvent.code`, which identifies the physical key position and does not
+change with the layout. The key next to `Tab` triggers the switcher whatever it happens to type.
+
+Consequences worth knowing:
+
+- Both paths can fire for one keypress. The service worker collapses triggers of the same command
+  arriving within 50 ms, which is far below a human double-tap and far above the millisecond gap
+  between the two paths.
+- The fallback runs in the page, so it is unavailable exactly where content scripts are — on
+  `chrome://` pages, the Web Store, other extensions' pages, and the PDF viewer. Chrome's own
+  accelerator is the only thing that works there, which is why binding it still matters.
+- The matcher is derived from whatever shortcut is actually bound, and falls back to the manifest's
+  suggestion when Chrome has bound nothing. Rebinding at `chrome://extensions/shortcuts` fires no
+  event, so the new binding is picked up when you next open the extension popup, or at the next
+  browser start.
+- Physical positions mean a remapped *layout* like Dvorak or Colemak triggers on the key where
+  QWERTY puts `Q`, not on wherever that layout prints `q`. This is the right behaviour for switching
+  input languages and the wrong one for a permanently remapped layout; rebind to suit.
+
+Prefer to avoid the whole problem instead? Bind a key that is identical in every layout — a digit,
+`Space`, an arrow, `Home`/`End`/`PageUp`/`PageDown`. Note that `Ctrl+Space` is a poor choice on
+macOS: it is the system shortcut for switching input source, which is the very thing you would be
+switching.
 
 No build step. `src/` is loadable as-is — for 32 KB of dependency-free code, a toolchain would be
 more to maintain than it saves.
@@ -77,6 +112,13 @@ readability.
 - `update_url` removed, so it can never pull a new version from the Web Store.
 - `_metadata/verified_contents.json` (Google's signing manifest) dropped.
 - Renamed, so it is visibly not the store extension. No `key`, so Chrome derives a fresh ID.
+
+**Behaviour**
+
+- **The shortcut survives a change of input language.** See [Keyboard layouts](#keyboard-layouts)
+  above — a `KeyboardEvent.code` matcher in the content script backs up Chrome's accelerator, which
+  is character-based and stops matching under a non-Latin layout. The same fallback keeps the
+  switcher usable when Chrome has left the command unbound.
 
 **Correctness**
 
@@ -152,6 +194,8 @@ exercise the switcher. There should be zero outbound requests.
 - Tabs are scoped to the current window.
 - The overlay renders other tabs' favicons, so opening it issues favicon requests to those origins
   from the current page. Inherent to showing favicons at all.
+- The in-page fallback calls `preventDefault()` on the shortcut, so a page that wanted that
+  combination for itself no longer receives it.
 
 ## Upstream
 

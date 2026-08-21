@@ -43,3 +43,17 @@ another extension — which is why the commands can show up unbound after a fres
 
 `Q` sits directly above `Tab` on QWERTY, so `MacCtrl+Q` (this fork's default, and upstream's) keeps
 almost the same hand position as the `Ctrl+Tab` you were after.
+
+## Does the in-page fallback rescue it?
+
+The fork now also matches the shortcut inside the page, on `KeyboardEvent.code`, so that a change of
+input language does not break it — see the *Keyboard layouts* section of the README. That matcher is
+not restricted to the `commands` API's key list, so `Ctrl+Tab` would be expressible.
+
+**Untested, and expected not to work.** Chrome reserves `Ctrl+Tab` as a browser-level shortcut for
+"next tab", and reserved combinations are handled in the browser process without being delivered to
+the renderer — a page cannot see or `preventDefault()` them. If that holds, the content script never
+receives the keydown and there is nothing to match.
+
+Worth thirty seconds if you care: run `addEventListener('keydown', e => console.log(e.code, e.ctrlKey))`
+in a page console and press Control+Tab. If it logs, this is achievable after all.
