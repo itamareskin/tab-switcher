@@ -120,8 +120,42 @@
     return document.adoptNode(parsed.querySelector(rootTag));
   }
 
-  function sendToWorker(message) {
-    return chrome.runtime.sendMessage(message);
+  /**
+   * True once the extension has been reloaded, updated, or removed out from under us.
+   *
+   * The isolated world this script runs in outlives that: the code keeps executing and
+   * its listeners keep firing, but chrome.runtime is dead and every call throws
+   * "Extension context invalidated". chrome.runtime.id going undefined is the signal.
+   */
+  function isOrphaned() {
+    try {
+      return !chrome.runtime?.id;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Stand down if we are orphaned.
+   *
+   * This matters more than it looks. onKeyDown claims the shortcut with
+   * preventDefault(), so an orphaned instance that stayed wired up would swallow the
+   * keystroke and then fail to act on it — the shortcut would be worse than dead until
+   * the page was reloaded. Tearing down restores the page to as if we were never here.
+   */
+  function standDownIfOrphaned() {
+    if (!isOrphaned()) return false;
+    window.__tabSwitcherTeardown?.();
+    return true;
+  }
+
+  async function sendToWorker(message) {
+    try {
+      return await chrome.runtime.sendMessage(message);
+    } catch (error) {
+      if (standDownIfOrphaned()) return undefined;
+      throw error;
+    }
   }
 
   /**
@@ -624,13 +658,18 @@
   }
 
   function onKeyDown(event) {
+    // Checked before anything is claimed, so an orphaned instance never eats the key.
+    if (standDownIfOrphaned()) return;
+
     // Skip auto-repeat: holding the key down should not cycle on its own.
     if (!event.repeat) {
       for (const command of ["prev-tab", "next-tab"]) {
         if (!matchesHotkey(event, hotkeys[command])) continue;
         event.preventDefault();
         event.stopImmediatePropagation();
-        sendToWorker({ type: "TRIGGER", command });
+        sendToWorker({ type: "TRIGGER", command }).catch((error) =>
+          console.warn("Failed to trigger the switcher", error),
+        );
         return;
       }
     }
