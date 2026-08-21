@@ -160,9 +160,13 @@
       return;
     }
 
-    // Session storage is empty at browser start, and after an unpacked reload the
-    // worker may not have republished yet. Ask; onStorageChanged delivers the answer.
+    // Session storage is empty at browser start, and after an unpacked reload the worker
+    // may not have republished yet. Re-read rather than waiting on onStorageChanged: the
+    // worker only writes when the value changed, so if it raced ahead of us and wrote the
+    // same matchers, no change event would ever arrive.
     await sendToWorker({ type: "REFRESH_HOTKEYS" });
+    const republished = await chrome.storage.session.get("hotkeys");
+    if (republished.hotkeys) hotkeys = republished.hotkeys;
   }
 
   /**
