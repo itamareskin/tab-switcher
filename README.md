@@ -40,8 +40,10 @@ command unbound — if `chrome.commands.getAll()` reports an empty `shortcut`, a
 that UI. On ordinary web pages the in-page fallback below covers that case anyway, but binding it
 properly is what makes the shortcut work on the new tab page and other internal pages.
 
-Wanted **`Ctrl+Tab`**? It is not achievable; [docs/ctrl-tab.md](docs/ctrl-tab.md) records what was
-tried and why.
+Wanted **`Ctrl+Tab`**? Chrome will not bind it — but an OS-level remapper that rewrites `Ctrl+Tab`
+to the bound shortcut before Chrome sees it does work, and combines with the layout handling below.
+[docs/ctrl-tab.md](docs/ctrl-tab.md) has a working Karabiner-Elements rule and records everything
+that was tried inside Chrome first.
 
 ## Keyboard layouts
 
