@@ -1,7 +1,12 @@
-# Ctrl+Tab: not achievable
+# Ctrl+Tab: not bindable in Chrome, reachable with a remapper
 
-**Conclusion: you cannot bind this extension to `Ctrl+Tab` on Chrome 151.** Tested 2026-08-19 on
-macOS, Chrome 151.0.7922.140. This page records what was tried so the same ground is not re-covered.
+**Conclusion: you cannot bind this extension to `Ctrl+Tab` from inside Chrome on Chrome 151** — not
+via the manifest, not via the shortcuts UI, and not via the `developerPrivate` workaround. You *can*
+get the behaviour by remapping the keystroke below the browser, which is what
+[What does work](#what-does-work-remap-below-the-browser) covers.
+
+Tested 2026-08-19 on macOS, Chrome 151.0.7922.140. This page records what was tried so the same
+ground is not re-covered.
 
 ## The two normal routes are blocked by design
 
@@ -34,15 +39,61 @@ If you want to re-test on a future Chrome, the control experiment is the whole t
 *allowed* key programmatically and re-read `getExtensionsInfo`. If a boring key will not stick,
 `Tab` certainly will not.
 
-## What to do instead
+## Staying inside Chrome
 
-Pick a key the `commands` API allows and assign it at `chrome://extensions/shortcuts` by clicking
+If you would rather not add an OS-level remapper, pick a key the `commands` API allows and assign it at `chrome://extensions/shortcuts` by clicking
 the field and pressing the combination. Manual assignment is reliable; the manifest's `suggested_key`
 is only a suggestion, and Chrome silently skips it when the combination is already claimed by
 another extension — which is why the commands can show up unbound after a fresh install.
 
 `Q` sits directly above `Tab` on QWERTY, so `MacCtrl+Q` (this fork's default, and upstream's) keeps
 almost the same hand position as the `Ctrl+Tab` you were after.
+
+## What does work: remap below the browser
+
+Everything above concerns getting *Chrome* to bind `Tab`. An OS-level remapper sidesteps the
+question entirely — it rewrites the event before Chrome ever sees it, so Chrome only ever handles a
+key it is willing to bind, and Chrome's reservation of `Ctrl+Tab` for "next tab" never comes into
+play either.
+
+With Karabiner-Elements, scoped to Chrome so the rest of the system is untouched:
+
+```json
+{
+  "description": "Ctrl+Tab / Ctrl+Shift+Tab cycle tabs via Tab Switcher",
+  "manipulators": [
+    {
+      "type": "basic",
+      "conditions": [
+        { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.google\\.Chrome$"] }
+      ],
+      "from": { "key_code": "tab", "modifiers": { "mandatory": ["control"] } },
+      "to": [{ "key_code": "q", "modifiers": ["left_control"] }]
+    }
+  ]
+}
+```
+
+Karabiner works in HID usage codes, so `key_code: q` means *the physical Q key*, not "whatever types
+q". It emits physical-Q regardless of input language — which pairs exactly with the
+`KeyboardEvent.code` matcher described below.
+
+Note that this does **not** by itself survive a language switch. Karabiner emits physical-Q; macOS
+then applies the input source, so under Hebrew that key produces `/` and Chrome's own accelerator
+sees `Ctrl+/`, not `Ctrl+Q`. The remapper solves `Tab`; the in-page matcher solves the layout. Both
+are needed for `Ctrl+Tab` to work in every language.
+
+One thing to verify on any such setup: Karabiner consumes the `mandatory` modifier and re-posts it
+with the `to` event, and hold-to-cycle depends on Control staying down across taps. If a `keyup` for
+Control appears between taps, the switcher will commit and close after the first one. Check with:
+
+```js
+addEventListener('keydown', e => console.log('down', e.code, e.ctrlKey, e.repeat), true);
+addEventListener('keyup',   e => console.log('up  ', e.key), true);
+```
+
+Hold Control and tap Tab a few times. Wanted: repeated `down KeyQ true false` with a single
+`up Control` at the end.
 
 ## Does the in-page fallback rescue it?
 
@@ -56,4 +107,5 @@ the renderer — a page cannot see or `preventDefault()` them. If that holds, th
 receives the keydown and there is nothing to match.
 
 Worth thirty seconds if you care: run `addEventListener('keydown', e => console.log(e.code, e.ctrlKey))`
-in a page console and press Control+Tab. If it logs, this is achievable after all.
+in a page console and press Control+Tab. If it logs, this is achievable without a remapper after all.
+The remapper route above does not depend on the answer, since it never lets Chrome see `Tab`.
