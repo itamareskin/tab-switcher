@@ -315,7 +315,6 @@ async function buildTabList() {
   return deduped.map((tab) => ({
     id: tab.id,
     title: tab.title ?? tab.url ?? tab.pendingUrl,
-    favIconUrl: tab.favIconUrl,
     url: tab.url,
     type: classifyTab(tab),
     isPinned: tab.pinned,

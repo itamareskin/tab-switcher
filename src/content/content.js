@@ -426,6 +426,22 @@
     return "";
   }
 
+  /**
+   * Favicons come from Chrome's own cache (the `favicon` permission), never from the site.
+   *
+   * Rendering `tab.favIconUrl` here made the *host page* request an icon from every origin
+   * you had open — a privacy leak on any page, and for a tab on localhost or a LAN address
+   * it tripped Chrome's local-network-access prompt, attributed to the page rather than to
+   * us. `_favicon/` is served by the extension itself, so nothing leaves the browser.
+   */
+  function faviconSrc(tab) {
+    if (!tab.url) return FALLBACK_FAVICON;
+    const url = new URL(chrome.runtime.getURL("/_favicon/"));
+    url.searchParams.set("pageUrl", tab.url);
+    url.searchParams.set("size", "32"); // 2x the 14px render, for retina
+    return url.toString();
+  }
+
   function itemMarkup(tab, index, activeIndex) {
     const closeButton = tab.isPinned
       ? ""
@@ -437,7 +453,7 @@
       <div data-index="${escapeHtml(index)}" class="${CLASS.item} ${index === activeIndex ? CLASS.active : ""}">
         <div class="${CLASS.preview}">${previewMarkup(tab)}</div>
         <span class="${CLASS.text}">
-          <img class="${CLASS.icon}" src="${escapeHtml(tab.favIconUrl || FALLBACK_FAVICON)}" alt="favicon">
+          <img class="${CLASS.icon}" src="${escapeHtml(faviconSrc(tab))}" alt="favicon">
           <span>${tab.title ? escapeHtml(tab.title) : "(untitled)"}</span>
         </span>
         ${closeButton}

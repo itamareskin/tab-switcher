@@ -8,7 +8,8 @@
     "tabs",
     "storage",
     "scripting",
-    "webNavigation"
+    "webNavigation",
+    "favicon"
   ],
   "host_permissions": ["<all_urls>"],
 
@@ -38,6 +39,7 @@
   "web_accessible_resources": [
     {
       "resources": [
+        "_favicon/*",
         "images/favicon.png",
         "images/unknown.svg",
         "images/chrome.newtab.svg",
