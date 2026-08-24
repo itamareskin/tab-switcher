@@ -114,6 +114,11 @@ readability.
   equally page-controlled.
 - `content.js` dropped from `web_accessible_resources`. `executeScript` with `files:` does not need
   it; only the images do.
+- **Favicons come from Chrome's cache, not from the sites.** Upstream rendered each tab's
+  `favIconUrl` as an `<img>` inside the page you were on, so opening the switcher made *that page*
+  request an icon from every origin you had open. The fork uses the `favicon` permission and serves
+  them from `chrome-extension://<id>/_favicon/` instead, so nothing leaves the browser. This costs
+  one added permission; see [AUDIT.md](AUDIT.md) for the reasoning.
 
 **Store decoupling**
 
@@ -200,8 +205,6 @@ exercise the switcher. There should be zero outbound requests.
   limit, not a bug.
 - Fullscreen is exited when the switcher opens, since a fullscreen element would cover it.
 - Tabs are scoped to the current window.
-- The overlay renders other tabs' favicons, so opening it issues favicon requests to those origins
-  from the current page. Inherent to showing favicons at all.
 - The in-page fallback calls `preventDefault()` on the shortcut, so a page that wanted that
   combination for itself no longer receives it.
 

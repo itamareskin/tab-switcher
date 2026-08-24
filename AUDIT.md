@@ -85,6 +85,9 @@ maps cleanly onto plausible hand-written source — which is why reconstructing 
 | `webNavigation` | `getAllFrames` to detect error pages, where content scripts cannot run, so the overlay can fall back to another tab. Narrow use of a broad permission. |
 | `<all_urls>` | Required both to inject the overlay anywhere and for `captureVisibleTab`. |
 
+**The fork adds a fifth: `favicon`.** Not present upstream, and added after this review — see
+*Post-audit changes* below.
+
 Confirmed **absent**: `cookies`, `history`, `webRequest`, `debugger`, `management`, `downloads`,
 `proxy`, `privacy`, `identity`, `desktopCapture`, `tabCapture`. No `externally_connectable`, so no
 website can message the extension directly.
@@ -167,6 +170,37 @@ if you know about it — so now you know.
 The capture is a single call site (`captureScreenshot` in `src/background.js`), deliberately left in
 one place so it is easy to gate behind a preference or delete outright. Doing so costs the
 thumbnails and nothing else; the switcher falls back to favicons.
+
+## Post-audit changes
+
+Everything above describes the audited snapshot. Changes made to the fork after the review are
+listed here rather than folded silently into the findings.
+
+### `favicon` permission added
+
+Upstream rendered `tab.favIconUrl` — a URL on the *site's* own server — as an `<img>` in the host
+page's DOM. Opening the switcher therefore made the page you were on issue a request to every origin
+you had open. For a tab on `localhost` or a LAN address, Chrome treats that as local network access
+and prompts *"<website> wants to access other apps and services on this device"*, blaming the page.
+
+The fork now requests `permissions: ["favicon"]` plus `_favicon/*` in `web_accessible_resources`, and
+builds `chrome-extension://<id>/_favicon/?pageUrl=...&size=32`. Chrome serves the icon from its own
+on-disk cache.
+
+What this costs and what it buys:
+
+- **Costs** one permission. `favicon` grants read access to Chrome's favicon cache, which is keyed by
+  URL — so it is a *very* weak inference channel about browsing history: you must already know a URL
+  to ask about it, and the answer is only whether an icon is cached. This extension already holds
+  `tabs` and `<all_urls>`, which reveal strictly more.
+- **Buys** the removal of all third-party requests from the overlay. `favIconUrl` was also dropped
+  from the payload the worker sends the content script, so site-hosted icon URLs no longer reach the
+  page at all. The zero-egress property is unaffected: `_favicon/` is an internal extension URL, not
+  a network fetch, and no `fetch`/`XHR` was added.
+
+Rejected alternative: proxying favicons through the service worker with `fetch()`. That would have
+made the extension itself talk to every origin you have open, destroying the headline finding of
+this audit.
 
 ## Limits of this review
 
