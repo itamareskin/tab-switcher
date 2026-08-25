@@ -80,6 +80,18 @@
   let isOpen = false;
   /** In-flight open, so a rapid second press advances the highlight instead of racing. */
   let opening = null;
+
+  /**
+   * Set when the modifier is released, cleared when it is pressed.
+   *
+   * Opening is not instant — a worker round-trip (with an MV3 cold start if the worker
+   * had gone idle), a storage read for thumbnails, then a render. A quick tap can finish
+   * before any of that does, and `onKeyUp` would then find `isOpen` still false and drop
+   * the commit, leaving the overlay up with nothing but a mouse click to resolve it.
+   * Clearing on keydown is what keeps this honest: every trigger starts with the modifier
+   * going down, so a stale release from some earlier, unrelated Ctrl tap cannot leak in.
+   */
+  let pendingRelease = false;
   let modifierKey = "Control";
   let prefs = DEFAULT_PREFS;
   /** Keydown matchers for each command, published by the worker. See matchesHotkey(). */
@@ -626,17 +638,13 @@
     modifierKey = message.modifierKey ?? "Control";
     prefs = message.prefs;
 
-    // Opening is async (storage read, then render). A second Ctrl+Q arriving inside
-    // that window would otherwise take the "not open yet" branch and restart the
-    // overlay instead of advancing the highlight, losing the keypress.
     if (opening) {
+      // Opening is async (storage read, then render). A second Ctrl+Q arriving inside
+      // that window would otherwise take the "not open yet" branch and restart the
+      // overlay instead of advancing the highlight, losing the keypress.
       await opening;
       highlight((selectedIndex + message.direction + tabs.length) % tabs.length);
-      overlay?.focus();
-      return;
-    }
-
-    if (isOpen) {
+    } else if (isOpen) {
       // Already up: just move the highlight, wrapping in the requested direction.
       highlight((selectedIndex + message.direction + tabs.length) % tabs.length);
     } else {
@@ -660,17 +668,24 @@
     }
 
     overlay?.focus();
+
+    // The modifier came back up while we were still opening, so the keyup found nothing
+    // to commit. Honour it now that there is.
+    if (pendingRelease) await commitSelection();
   }
 
   async function commitSelection() {
     if (!isOpen) return;
+    pendingRelease = false;
     hideOverlay();
     await activateSelected();
   }
 
   /** Releasing the modifier commits, mirroring Alt+Tab. */
   async function onKeyUp(event) {
-    if (event.key === modifierKey) await commitSelection();
+    if (event.key !== modifierKey) return;
+    pendingRelease = true;
+    await commitSelection();
   }
 
   function onKeyDown(event) {
@@ -690,7 +705,10 @@
       }
     }
 
-    if (event.key === modifierKey) return;
+    if (event.key === modifierKey) {
+      pendingRelease = false;
+      return;
+    }
     if (event.key === "Escape" && isOpen) {
       hideOverlay();
       // Stop the page from also acting on Escape (closing its own modal, etc).
