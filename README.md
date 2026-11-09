@@ -1,18 +1,92 @@
 # Tab Switcher
 
-An audited fork of [Tab Flick](https://chromewebstore.google.com/detail/kdddoanokjocdkbkmgnkkcemjepknlgm)
-0.2.0 by Eugene Gluhotorenko. Alt+Tab, but for browser tabs: hold `Ctrl+Q`, keep tapping to cycle
-through recent tabs, release to jump.
+Alt+Tab, but for browser tabs: hold `Ctrl+Q`, keep tapping to cycle through recent tabs, release to
+jump. An audited fork of [Tab Flick](https://chromewebstore.google.com/detail/kdddoanokjocdkbkmgnkkcemjepknlgm)
+0.2.0 — **read [AUDIT.md](AUDIT.md) before loading**, and know that it keeps in-memory screenshots
+of your open tabs for the preview thumbnails (see
+[Privacy](#privacy-it-screenshots-your-tabs), including how to turn that off).
+
+## Install
+
+1. Clone this repository. No build step — `src/` is loadable as-is.
+2. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, select `src/`.
+3. At `chrome://extensions/shortcuts`, confirm both commands are bound: `Ctrl+Q` (next) and
+   `Ctrl+Shift+Q` (previous) — on macOS `MacCtrl+Q` / `MacCtrl+Shift+Q`, the physical Control key,
+   not Command. Chrome sometimes leaves a shortcut unassigned; if a field is blank, click it and
+   press the combination.
+4. Reload any tabs that were already open. Tabs opened before the extension loaded (or before an
+   extension reload) cannot run the switcher until they are reloaded.
+
+That's it: hold `Ctrl+Q`, tap to cycle, release to jump. Everything under
+[Background](#background) is optional reading.
+
+### Optional: use `Ctrl+Tab` instead (macOS)
+
+Chrome refuses to bind `Tab` to an extension, so the keystroke is rewritten *below* the browser
+with [Karabiner-Elements](https://karabiner-elements.pqrs.org/), scoped to Chrome so the rest of
+the system is untouched.
+
+1. Install Karabiner-Elements (`brew install --cask karabiner-elements`) and grant the driver and
+   Input Monitoring permissions it walks you through on first launch.
+
+2. Save this as `~/.config/karabiner/assets/complex_modifications/tab-switcher.json`:
+
+   ```json
+   {
+     "title": "Tab Switcher",
+     "rules": [
+       {
+         "description": "Ctrl+Tab / Ctrl+Shift+Tab cycle tabs via Tab Switcher",
+         "manipulators": [
+           {
+             "type": "basic",
+             "conditions": [
+               { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.google\\.Chrome$"] }
+             ],
+             "from": { "key_code": "tab", "modifiers": { "mandatory": ["control"] } },
+             "to": [{ "key_code": "q", "modifiers": ["left_control"] }]
+           },
+           {
+             "type": "basic",
+             "conditions": [
+               { "type": "frontmost_application_if", "bundle_identifiers": ["^com\\.google\\.Chrome$"] }
+             ],
+             "from": { "key_code": "tab", "modifiers": { "mandatory": ["control", "shift"] } },
+             "to": [{ "key_code": "q", "modifiers": ["left_control", "left_shift"] }]
+           }
+         ]
+       }
+     ]
+   }
+   ```
+
+3. In Karabiner-Elements → **Complex Modifications** → **Add predefined rule**, enable
+   *Ctrl+Tab / Ctrl+Shift+Tab cycle tabs via Tab Switcher*.
+
+`Ctrl+Tab` now cycles forward and `Ctrl+Shift+Tab` backward. The remapper only *produces*
+`Ctrl+Q` / `Ctrl+Shift+Q`, so this depends on step 3 of the install above — Chrome still has to
+have those shortcuts bound. Details, caveats, and everything that was tried inside Chrome first:
+[`Ctrl+Tab` notes](#ctrltab-notes) below and [docs/ctrl-tab.md](docs/ctrl-tab.md).
+
+---
+
+## Background
+
+**Nothing below this line is needed to install or use the extension.** It is the record of why
+this fork exists, what was changed and audited, and the platform quirks that shaped it.
+
+### Why this fork exists
 
 This exists so the code that runs in the browser is code that has been read. A Web Store extension
 updates itself silently, so installing one is a bet on the developer's future behaviour as much as
-their present code. This repository freezes v0.2.0 at a reviewed state and severs the update channel.
+their present code. This repository freezes v0.2.0 at a reviewed state and severs the update
+channel.
 
-**Read [AUDIT.md](AUDIT.md) before loading this.** Short version: no network egress, no dynamic code,
-no obfuscation, all permissions justified — and it screenshots every page you visit into memory,
-which the store listing never mentions.
+Short version of [AUDIT.md](AUDIT.md): no network egress, no dynamic code, no obfuscation, all
+permissions justified — and it screenshots every page you visit into memory, which the store
+listing never mentions.
 
-## Layout
+### Layout
 
 | Path | What it is |
 |---|---|
@@ -25,27 +99,25 @@ which the store listing never mentions.
 Commit history mirrors that order: import, then audit, then fork. The `src/` commit diffs against
 code that was already reviewed.
 
-## Install
+No build step. `src/` is loadable as-is — for 32 KB of dependency-free code, a toolchain would be
+more to maintain than it saves.
 
-```
-chrome://extensions  →  enable Developer mode  →  Load unpacked  →  select src/
-```
+### `Ctrl+Tab` notes
 
-Confirm at `chrome://extensions/shortcuts` that `Ctrl+Q` is bound (macOS: `MacCtrl+Q`, i.e. the
-physical Control key, not Command). Chrome sometimes leaves a suggested shortcut unassigned when
-another extension holds it.
+Chrome will not bind `Tab` from inside the browser — not via the manifest, not via the shortcuts
+UI, not via the documented `developerPrivate` workaround. [docs/ctrl-tab.md](docs/ctrl-tab.md)
+records everything that was tried. The Karabiner rule in the install section sidesteps it by
+rewriting the keystroke before Chrome sees it. Two properties worth knowing:
 
-Chrome will silently skip a suggested shortcut that another extension already claims, leaving the
-command unbound — if `chrome.commands.getAll()` reports an empty `shortcut`, assign it by hand in
-that UI. On ordinary web pages the in-page fallback below covers that case anyway, but binding it
-properly is what makes the shortcut work on the new tab page and other internal pages.
+- Hold-to-cycle depends on Control staying down across taps, and Karabiner consumes and re-posts
+  the `mandatory` modifier. The doc has a console snippet to verify no stray Control `keyup`
+  appears between taps — wanted: repeated `down KeyQ true` with a single `up Control` at the end.
+- Karabiner emits the *physical* Q key, so under a non-Latin layout macOS turns it into whatever
+  that key types and Chrome's accelerator stops matching. The `KeyboardEvent.code` fallback below
+  is what keeps `Ctrl+Tab` working in every language — the remapper and the fallback solve two
+  different halves of the problem.
 
-Wanted **`Ctrl+Tab`**? Chrome will not bind it — but an OS-level remapper that rewrites `Ctrl+Tab`
-to the bound shortcut before Chrome sees it does work, and combines with the layout handling below.
-[docs/ctrl-tab.md](docs/ctrl-tab.md) has a working Karabiner-Elements rule and records everything
-that was tried inside Chrome first.
-
-## Keyboard layouts
+### Keyboard layouts
 
 Chrome matches its shortcut accelerators against the *character* the active keyboard layout
 produces. Bind `Ctrl+Q` while typing English, switch your input language to Hebrew, Russian, Greek,
@@ -63,7 +135,8 @@ Consequences worth knowing:
   between the two paths.
 - The fallback runs in the page, so it is unavailable exactly where content scripts are — on
   `chrome://` pages, the Web Store, other extensions' pages, and the PDF viewer. Chrome's own
-  accelerator is the only thing that works there, which is why binding it still matters.
+  accelerator is the only thing that works there, which is why binding the shortcut properly at
+  `chrome://extensions/shortcuts` still matters even though the fallback covers ordinary pages.
 - The matcher is derived from whatever shortcut is actually bound, and falls back to the manifest's
   suggestion when Chrome has bound nothing. Rebinding at `chrome://extensions/shortcuts` fires no
   event, so the new binding is picked up when you next open the extension popup, or at the next
@@ -83,10 +156,7 @@ instances alive but unable to talk to the service worker. They now detect that a
 themselves, so the page behaves normally — but the switcher does not work in those tabs until they
 are reloaded.
 
-No build step. `src/` is loadable as-is — for 32 KB of dependency-free code, a toolchain would be
-more to maintain than it saves.
-
-## Privacy: it screenshots your tabs
+### Privacy: it screenshots your tabs
 
 On every tab switch and page load the extension calls `captureVisibleTab` and keeps a low-quality
 JPEG so the switcher can show previews. That includes your email, your bank, and anything else you
@@ -100,7 +170,7 @@ To turn it off, delete or gate `captureScreenshot()` in [src/background.js](src/
 single capture site, kept in one place for exactly this reason. You lose thumbnails and nothing
 else; the switcher falls back to favicons.
 
-## Changes from upstream
+### Changes from upstream
 
 Behaviour is intentionally unchanged. The differences are the three audit findings plus source
 readability.
@@ -173,7 +243,7 @@ Mostly bugs inherited from upstream, found while porting or during review.
 - Image `error` handler attached once at construction rather than on every render.
 - Debug `console.log` calls removed; `console.warn` on genuine failures kept.
 
-## Re-verifying
+### Re-verifying
 
 The greps behind the audit, to run yourself:
 
@@ -197,7 +267,7 @@ Runtime check, which catches what static review cannot: open DevTools on both th
 (via the extension card's "service worker" link) and an ordinary tab, watch the Network panel, and
 exercise the switcher. There should be zero outbound requests.
 
-## Known limits
+### Known limits
 
 - **The overlay cannot appear on `chrome://` pages, the Web Store, or other extensions' pages.**
   Chrome forbids content scripts there. Pressing `Ctrl+Q` on such a tab switches to a tab that *can*
@@ -208,7 +278,7 @@ exercise the switcher. There should be zero outbound requests.
 - The in-page fallback calls `preventDefault()` on the shortcut, so a page that wanted that
   combination for itself no longer receives it.
 
-## Upstream
+### Upstream
 
 Eugene Gluhotorenko · e.gluhotorenko@gmail.com · v0.2.0, published 2025-10-30.
 Credit for the design and implementation is theirs; this fork is a reviewed copy, not original work.
